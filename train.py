@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 
 class RandomTokenDataset(Dataset):
@@ -53,12 +53,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def initialize_engine(deepspeed, args, model, loader):
+def initialize_engine(deepspeed, args, model, dataset):
     return deepspeed.initialize(
         args=args,
         model=model,
         model_parameters=model.parameters(),
-        training_data=loader,
+        training_data=dataset,
     )
 
 
@@ -73,9 +73,8 @@ def main():
 
     model = load_model(args.model_name, vocab_size=args.vocab_size, seq_len=args.seq_len)
     dataset = RandomTokenDataset(args.dataset_samples, args.seq_len, args.vocab_size)
-    loader = DataLoader(dataset, batch_size=None, shuffle=False)
 
-    engine, _, _, _ = initialize_engine(deepspeed, args, model, loader)
+    engine, _, _, _ = initialize_engine(deepspeed, args, model, dataset)
 
     engine.train()
     data_iter = iter(engine.training_dataloader)
