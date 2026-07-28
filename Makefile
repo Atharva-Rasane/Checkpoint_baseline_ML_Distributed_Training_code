@@ -4,7 +4,7 @@ VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 DEEPSPEED ?= $(VENV)/bin/deepspeed
 CUDA_HOME ?= $(shell if [ -n "$$CUDA_HOME" ]; then echo "$$CUDA_HOME"; elif [ -d /usr/local/cuda ]; then echo /usr/local/cuda; elif [ -d /usr/local/cuda-12.6 ]; then echo /usr/local/cuda-12.6; elif [ -d /usr/local/cuda-12.8 ]; then echo /usr/local/cuda-12.8; fi)
-CUDA_ENV = $(if $(CUDA_HOME),CUDA_HOME=$(CUDA_HOME) PATH=$(CUDA_HOME)/bin:$$PATH,)
+CUDA_ENV = $(if $(CUDA_HOME),CUDA_HOME=$(CUDA_HOME) PATH=$(abspath $(VENV))/bin:$(CUDA_HOME)/bin:$$PATH,)
 GPUS ?= 1
 HOSTFILE ?= hostfile
 MODEL ?= tiny_gpt
@@ -25,8 +25,8 @@ cuda-check:
 doctor: cuda-check
 	$(PYTHON) --version
 	$(PYTHON) -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), 'cuda_version', torch.version.cuda, 'gpu_count', torch.cuda.device_count())"
-	$(PYTHON) -c "import ninja; print('ninja', ninja.__version__)"
-	$(DEEPSPEED) --version
+	$(CUDA_ENV) ninja --version
+	$(CUDA_ENV) $(PYTHON) -c "import deepspeed; print('deepspeed', deepspeed.__version__)"
 	nvidia-smi
 	$(CUDA_HOME)/bin/nvcc --version
 
