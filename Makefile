@@ -1,4 +1,4 @@
-.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode test lint check clean
+.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode collect visualize serve test lint check clean
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
@@ -9,7 +9,17 @@ GPUS ?= 1
 HOSTFILE ?= hostfile
 MODEL ?= tiny_gpt
 STEPS ?= 100
+SAVE_EVERY ?= 100
 MASTER_ADDR ?= localhost
+TRACE ?= 0
+TRACE_DIR ?= visualization/traces
+RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
+TRACE_ARGS = $(if $(filter 1 true yes,$(TRACE)),--trace --trace_dir $(TRACE_DIR) --run_id $(RUN_ID),)
+TRAIN_ARGS = --model_name $(MODEL) --steps $(STEPS) --save_every $(SAVE_EVERY) $(TRACE_ARGS)
+VIS_DIR ?= visualization
+REMOTE_DIR ?= $(CURDIR)
+SERVE_HOST ?= 127.0.0.1
+PORT ?= 8000
 
 setup:
 	python3 -m venv $(VENV)
@@ -35,13 +45,22 @@ hostfile-local:
 	cat $(HOSTFILE)
 
 train: cuda-check
-	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) train.py --model_name $(MODEL) --steps $(STEPS)
+	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) train.py $(TRAIN_ARGS)
 
 train-hostfile-local: cuda-check hostfile-local
-	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) train.py $(TRAIN_ARGS)
 
 train-multinode: cuda-check
-	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) train.py $(TRAIN_ARGS)
+
+collect:
+	$(PYTHON) $(VIS_DIR)/trace_tools.py collect --hostfile $(HOSTFILE) --source $(TRACE_DIR) --output $(VIS_DIR)/collected --remote-dir $(REMOTE_DIR)
+
+visualize: collect
+	$(PYTHON) $(VIS_DIR)/trace_tools.py build --data $(VIS_DIR)/collected --output $(VIS_DIR)/index.html
+
+serve: visualize
+	$(PYTHON) $(VIS_DIR)/trace_tools.py serve --directory $(VIS_DIR) --host $(SERVE_HOST) --port $(PORT)
 
 test:
 	$(PYTHON) -m pytest -q
@@ -52,4 +71,4 @@ lint:
 check: lint test
 
 clean:
-	rm -rf .pytest_cache .ruff_cache __pycache__ llm_models/__pycache__ tests/__pycache__ checkpoints
+	rm -rf .pytest_cache .ruff_cache __pycache__ llm_models/__pycache__ tests/__pycache__ checkpoints visualization/traces visualization/collected visualization/index.html

@@ -149,6 +149,45 @@ make train-multinode HOSTFILE=hostfile MASTER_ADDR=10.128.0.12 MODEL=tiny_gpt ST
 
 Checkpoints are saved under `checkpoints/`.
 
+## Full Distributed Traces
+
+Tracing is opt-in because collecting every CPU operation, CUDA kernel, tensor shape, stack, FLOP estimate, and memory event adds significant overhead and can produce large files.
+
+Run a traced job and include at least one checkpoint:
+
+```bash
+make train-hostfile-local MODEL=tiny_gpt STEPS=10 SAVE_EVERY=5 TRACE=1
+```
+
+Each rank writes an operator timeline, graph execution trace, step metrics, GPU memory, and checkpoint events below `visualization/traces/<run-id>/<host>/rank-<rank>/`.
+
+Collect traces from every host in `hostfile` and build the dashboard:
+
+```bash
+make collect
+make visualize
+```
+
+`make visualize` already runs collection, so the shorter equivalent is:
+
+```bash
+make visualize
+```
+
+Serve the dashboard locally:
+
+```bash
+make serve PORT=8000
+```
+
+Open `http://127.0.0.1:8000`. From a GCP VM, use an SSH tunnel from your computer and then open the same address:
+
+```bash
+gcloud compute ssh atharva-instace --zone=us-central1-b -- -L 8000:localhost:8000
+```
+
+The dashboard links operator traces to Perfetto for detailed timeline inspection. Multi-node collection uses `scp`, so the launcher VM must have passwordless SSH access to every host, as required by DeepSpeed launch.
+
 Development:
 
 ```bash
