@@ -2,6 +2,7 @@ import argparse
 import importlib
 import json
 import os
+import resource
 import socket
 import time
 from contextlib import contextmanager, nullcontext
@@ -177,6 +178,43 @@ class RandomTokenDataset(Dataset):
         return {"input_ids": tokens, "labels": tokens.clone()}
 
 
+def system_metrics(device):
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    values = {
+        "host_load_1m": os.getloadavg()[0],
+        "process_rss_bytes": int(usage.ru_maxrss) * 1024,
+    }
+    cuda_metrics = {
+        "utilization": "cuda_utilization_percent",
+        "memory_usage": "cuda_memory_usage_percent",
+        "temperature": "cuda_temperature_c",
+        "power_draw": "cuda_power_draw_mw",
+        "clock_rate": "cuda_clock_mhz",
+    }
+    for function_name, output_name in cuda_metrics.items():
+        function = getattr(torch.cuda, function_name, None)
+        if function is None:
+            continue
+        try:
+            values[output_name] = function(device)
+        except (ImportError, ModuleNotFoundError, RuntimeError):
+            continue
+    return values
+
+
+def directory_stats(path):
+    try:
+        file_count = 0
+        total_bytes = 0
+        for file in Path(path).rglob("*"):
+            if file.is_file():
+                file_count += 1
+                total_bytes += file.stat().st_size
+        return file_count, total_bytes
+    except OSError:
+        return 0, 0
+
+
 def load_model(model_name, **kwargs):
     module_path = f"llm_models.{model_name}"
     try:
@@ -292,6 +330,7 @@ def main():
                     cuda_allocated_bytes=torch.cuda.memory_allocated(engine.device),
                     cuda_reserved_bytes=torch.cuda.memory_reserved(engine.device),
                     cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(engine.device),
+                    **system_metrics(engine.device),
                 )
 
             if rank == 0 and step % 10 == 0:
@@ -303,12 +342,23 @@ def main():
                 trace.log("checkpoint_start", step=step, tag=tag, output_dir=args.output_dir)
                 with trace.span("Checkpoint", "Save checkpoint", step=step, tag=tag):
                     engine.save_checkpoint(args.output_dir, tag=tag)
+                checkpoint_duration_ms = (time.perf_counter() - checkpoint_started) * 1000
+                checkpoint_files, checkpoint_bytes = (
+                    directory_stats(Path(args.output_dir) / tag) if rank == 0 else (0, 0)
+                )
                 trace.log(
                     "checkpoint_complete",
                     step=step,
                     tag=tag,
                     output_dir=args.output_dir,
-                    duration_ms=(time.perf_counter() - checkpoint_started) * 1000,
+                    duration_ms=checkpoint_duration_ms,
+                    checkpoint_file_count=checkpoint_files,
+                    checkpoint_size_bytes=checkpoint_bytes,
+                    checkpoint_throughput_mib_s=(
+                        checkpoint_bytes / 1024**2 / (checkpoint_duration_ms / 1000)
+                        if checkpoint_duration_ms > 0
+                        else 0
+                    ),
                 )
 
         if rank == 0:

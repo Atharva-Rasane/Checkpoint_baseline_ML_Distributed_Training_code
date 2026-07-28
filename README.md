@@ -172,8 +172,8 @@ make visualize
 
 `make visualize` selects the newest collected run and creates:
 
-- `visualization/index.html`: aggregate activity, loss and latency, rank heatmap, checkpoints, and slow spans across every node.
-- `visualization/nodes/<host>.html`: detailed resource lanes, rank metrics, memory, checkpoints, and raw traces for one node.
+- `visualization/index.html`: a self-contained report with embedded Plotly, aggregate activity, loss and latency, telemetry, CPU operators, GPU kernels, NCCL operations, checkpoints, slow spans, and every node's detailed views.
+- `visualization/nodes/<host>.html`: separate detailed resource lanes, rank metrics, memory, telemetry, operators, checkpoints, and raw traces for one node.
 
 It already runs collection, so the shorter equivalent is:
 
@@ -212,6 +212,8 @@ gs://gbc-oit-rc-basil-app-bo-training-traces/atharva-instace_20260728_191530/
 ```bash
 make upload BUCKET=my-trace-bucket UPLOAD_PREFIX=my-run
 ```
+
+The command prints an authenticated `https://storage.cloud.google.com/.../index.html` URL. The uploaded `index.html` is self-contained and is stored with `Content-Type: text/html` and `Content-Disposition: inline`, so its charts do not depend on sibling objects. A private bucket does not provide an anonymous static-website URL; use the printed authenticated URL or a signed URL. Private raw operator traces should be downloaded and opened with Perfetto's **Open trace file** command.
 
 The VM uses its attached service account through Application Default Credentials. A GCE VM created with a read-only Storage OAuth scope must be changed once to the `cloud-platform` scope; GCP requires the VM to be stopped for this operation:
 

@@ -8,11 +8,13 @@ import re
 import shutil
 import socket
 import subprocess
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
+import ijson
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.offline import get_plotlyjs
@@ -41,6 +43,18 @@ PLOT_CONFIG = {
     "displaylogo": False,
     "scrollZoom": True,
 }
+COMMUNICATION_TERMS = (
+    "nccl",
+    "all_reduce",
+    "allreduce",
+    "all_gather",
+    "allgather",
+    "reduce_scatter",
+    "broadcast",
+    "c10d",
+    "send",
+    "recv",
+)
 
 
 def read_hosts(hostfile):
@@ -95,6 +109,46 @@ def _read_jsonl(path):
     return events
 
 
+def summarize_operator_trace(path):
+    summary = {
+        "cpu": Counter(),
+        "gpu": Counter(),
+        "communication": Counter(),
+        "counts": Counter(),
+        "memory_peak_bytes": 0,
+        "memory_events": 0,
+    }
+    try:
+        with path.open("rb") as trace_file:
+            for event in ijson.items(trace_file, "traceEvents.item"):
+                name = str(event.get("name") or "unknown")
+                category = str(event.get("cat") or "").lower()
+                duration_us = float(event.get("dur") or 0)
+                lower_name = name.lower()
+                if category == "cpu_op":
+                    summary["cpu"][name] += duration_us
+                    summary["counts"]["cpu"] += 1
+                if category in {"kernel", "gpu_memcpy", "gpu_memset"}:
+                    summary["gpu"][name] += duration_us
+                    summary["counts"]["gpu"] += 1
+                if category in {"cpu_op", "kernel", "user_annotation", "cuda_runtime"} and any(
+                    term in lower_name for term in COMMUNICATION_TERMS
+                ):
+                    summary["communication"][name] += duration_us
+                    summary["counts"]["communication"] += 1
+                if name == "[memory]":
+                    args = event.get("args") or {}
+                    if int(args.get("Device Type") or 0) == 1:
+                        summary["memory_peak_bytes"] = max(
+                            summary["memory_peak_bytes"],
+                            int(args.get("Total Allocated") or 0),
+                        )
+                        summary["memory_events"] += 1
+    except (OSError, ijson.JSONError, ValueError):
+        summary["parse_error"] = True
+    return summary
+
+
 def load_workers(data_dir):
     workers = []
     for metrics_file in sorted(data_dir.rglob("metrics.jsonl")):
@@ -103,6 +157,7 @@ def load_workers(data_dir):
         worker_dir = metrics_file.parent
         host = str(start.get("host") or worker_dir.parent.name)
         run_id = worker_dir.parent.parent.name
+        operator_trace = worker_dir / "operator-trace.json"
         workers.append(
             {
                 "worker": f"{host}/rank-{start.get('rank', worker_dir.name.removeprefix('rank-'))}",
@@ -118,11 +173,8 @@ def load_workers(data_dir):
                 "checkpoints": [
                     event for event in events if event.get("event") == "checkpoint_complete"
                 ],
-                "operator_trace": (
-                    worker_dir / "operator-trace.json"
-                    if (worker_dir / "operator-trace.json").exists()
-                    else None
-                ),
+                "operator_trace": operator_trace if operator_trace.exists() else None,
+                "operator_summary": summarize_operator_trace(operator_trace),
                 "execution_trace": (
                     worker_dir / "execution-trace.json"
                     if (worker_dir / "execution-trace.json").exists()
@@ -422,6 +474,89 @@ def memory_figure(workers):
     return figure
 
 
+def system_metrics_figure(workers):
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.14,
+        specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
+        subplot_titles=("GPU health", "Host process health"),
+    )
+    gpu_fields = [
+        ("cuda_utilization_percent", "GPU utilization", 1, False),
+        ("cuda_memory_usage_percent", "GPU memory utilization", 1, False),
+        ("cuda_temperature_c", "GPU temperature", 1, False),
+        ("cuda_power_draw_mw", "GPU power", 1, True),
+    ]
+    host_fields = [
+        ("process_rss_bytes", "Process RSS", 2, False),
+        ("host_load_1m", "Host load 1m", 2, True),
+    ]
+    for worker in workers:
+        for field, label, row, secondary in [*gpu_fields, *host_fields]:
+            values = []
+            steps = []
+            for step in worker["steps"]:
+                if step.get(field) is None:
+                    continue
+                value = float(step[field])
+                if field == "cuda_power_draw_mw":
+                    value /= 1000
+                elif field == "process_rss_bytes":
+                    value /= 1024**3
+                steps.append(step.get("step"))
+                values.append(value)
+            if not values:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=steps,
+                    y=values,
+                    name=f"{worker['worker']} {label}",
+                    mode="lines+markers",
+                    hovertemplate="step=%{x}<br>value=%{y:.3f}<extra>%{fullData.name}</extra>",
+                ),
+                row=row,
+                col=1,
+                secondary_y=secondary,
+            )
+    figure.update_layout(**_layout("GPU and host telemetry", 680))
+    figure.update_xaxes(title="Training step", row=2, col=1)
+    figure.update_yaxes(title="Percent / C", row=1, col=1, secondary_y=False)
+    figure.update_yaxes(title="Power (W)", row=1, col=1, secondary_y=True)
+    figure.update_yaxes(title="Process RSS (GiB)", row=2, col=1, secondary_y=False)
+    figure.update_yaxes(title="Host load", row=2, col=1, secondary_y=True)
+    return figure
+
+
+def operator_figure(workers, key, title):
+    totals = Counter()
+    counts = Counter()
+    for worker in workers:
+        totals.update(worker["operator_summary"].get(key, {}))
+        if key == "cpu":
+            counts["events"] += worker["operator_summary"]["counts"]["cpu"]
+        elif key == "gpu":
+            counts["events"] += worker["operator_summary"]["counts"]["gpu"]
+        else:
+            counts["events"] += worker["operator_summary"]["counts"]["communication"]
+    top = totals.most_common(25)
+    figure = go.Figure(
+        go.Bar(
+            x=[duration / 1000 for _, duration in reversed(top)],
+            y=[name for name, _ in reversed(top)],
+            orientation="h",
+            marker={"color": CATEGORY_COLORS["Training"] if key == "cpu" else "#7c3aed"},
+            hovertemplate="%{y}<br>total=%{x:.3f}ms<extra></extra>",
+        )
+    )
+    figure.update_layout(**_layout(f"{title} ({counts['events']:,} events)", 620))
+    figure.update_xaxes(title="Cumulative duration (ms)")
+    figure.update_yaxes(automargin=True)
+    return figure
+
+
 def aggregate_activity_figure(spans, buckets=160):
     figure = go.Figure()
     if not spans:
@@ -501,10 +636,19 @@ def checkpoint_figure(workers):
                     name=worker["worker"],
                     x=[row.get("step") for row in rows],
                     y=[row.get("duration_ms") for row in rows],
-                    customdata=[[row.get("tag", ""), row.get("output_dir", "")] for row in rows],
+                    customdata=[
+                        [
+                            row.get("tag", ""),
+                            row.get("output_dir", ""),
+                            float(row.get("checkpoint_size_bytes") or 0) / 1024**3,
+                            float(row.get("checkpoint_throughput_mib_s") or 0),
+                        ]
+                        for row in rows
+                    ],
                     hovertemplate=(
                         "step=%{x}<br>duration=%{y:.3f}ms<br>tag=%{customdata[0]}"
-                        "<br>directory=%{customdata[1]}<extra>%{fullData.name}</extra>"
+                        "<br>directory=%{customdata[1]}<br>size=%{customdata[2]:.3f}GiB"
+                        "<br>throughput=%{customdata[3]:.2f}MiB/s<extra>%{fullData.name}</extra>"
                     ),
                 )
             )
@@ -581,10 +725,13 @@ def _checkpoint_table(workers):
                 f"<td>{checkpoint.get('step', '-')}</td>"
                 f"<td>{html.escape(str(checkpoint.get('tag', '-')))}</td>"
                 f"<td>{float(checkpoint.get('duration_ms') or 0):.3f} ms</td>"
+                f"<td>{float(checkpoint.get('checkpoint_size_bytes') or 0) / 1024**3:.3f} GiB</td>"
+                f"<td>{int(checkpoint.get('checkpoint_file_count') or 0)}</td>"
+                f"<td>{float(checkpoint.get('checkpoint_throughput_mib_s') or 0):.2f} MiB/s</td>"
                 f"<td><code>{html.escape(str(checkpoint.get('output_dir', '-')))}</code></td>"
                 "</tr>"
             )
-    return "".join(rows) or '<tr><td colspan="5" class="empty">No checkpoints recorded.</td></tr>'
+    return "".join(rows) or '<tr><td colspan="8" class="empty">No checkpoints recorded.</td></tr>'
 
 
 def _slow_span_table(spans, limit=100):
@@ -611,6 +758,7 @@ section{background:#fff;border-top:1px solid #d9e0e5;margin-top:24px;padding:18p
 .table-wrap{overflow:auto;padding:0 18px 16px}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}
 th,td{text-align:left;padding:9px;border-bottom:1px solid #e3e8ec}th{color:#60717d;font-weight:600;background:#f7f9fb;position:sticky;top:0}
 code{font-family:Consolas,monospace}.empty{color:#60717d}.node-links{display:flex;gap:12px;flex-wrap:wrap;padding:0 18px 16px}
+.node-report{border-top:3px solid #24313a;margin-top:42px;padding-top:20px}.node-report>h2{font-size:22px;margin:0 0 8px}.node-report>.subtitle{color:#60717d;margin:0 0 18px}
 """
 
 
@@ -623,15 +771,20 @@ for(const link of document.querySelectorAll('.perfetto')){
 """
 
 
-def _document(title, subtitle, body, script_path, nav=""):
+def _document(title, subtitle, body, script_path=None, nav="", inline_plotly=False):
+    plotly_script = (
+        f"<script>{get_plotlyjs()}</script>"
+        if inline_plotly
+        else f'<script src="{script_path}"></script>'
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title><style>{BASE_CSS}</style><script src="{script_path}"></script></head>
+<title>{html.escape(title)}</title><style>{BASE_CSS}</style>{plotly_script}</head>
 <body><header><h1>{html.escape(title)}</h1><p>{html.escape(subtitle)}</p>{nav}</header>
 <main>{body}</main>{PERFETTO_SCRIPT}</body></html>"""
 
 
-def write_node_page(host, workers, spans, resource_spans, output_file, run_id):
+def node_body(host, workers, spans, resource_spans, page, run_id, prefix, heading=False):
     host_spans = [span for span in spans if span["host"] == host]
     host_resource_spans = [span for span in resource_spans if span["host"] == host]
     all_steps = [step for worker in workers for step in worker["steps"]]
@@ -640,8 +793,16 @@ def write_node_page(host, workers, spans, resource_spans, output_file, run_id):
         (float(step.get("cuda_peak_allocated_bytes") or 0) for step in all_steps),
         default=0,
     )
+    heading_html = (
+        f'<div id="node-{safe_name(host)}" class="node-report"><h2>Node trace: '
+        f'{html.escape(host)}</h2><p class="subtitle">{html.escape(workers[0]["model"])} | '
+        f'{html.escape(run_id)}</p>'
+        if heading
+        else ""
+    )
     body = (
-        '<div class="metrics">'
+        heading_html
+        + '<div class="metrics">'
         + _cards(
             [
                 ("Run", run_id),
@@ -654,21 +815,40 @@ def write_node_page(host, workers, spans, resource_spans, output_file, run_id):
         )
         + "</div>"
         + '<section><h2>Resource occupancy</h2>'
-        + _figure_html(resource_timeline(host_resource_spans, host), "resource-timeline")
+        + _figure_html(resource_timeline(host_resource_spans, host), f"{prefix}-resource-timeline")
         + "</section>"
         + '<section><h2>Step performance</h2>'
-        + _figure_html(step_performance_figure(workers, "Loss and latency by rank"), "step-performance")
+        + _figure_html(
+            step_performance_figure(workers, "Loss and latency by rank"),
+            f"{prefix}-step-performance",
+        )
         + "</section>"
         + '<section><h2>CUDA memory</h2>'
-        + _figure_html(memory_figure(workers), "cuda-memory")
+        + _figure_html(memory_figure(workers), f"{prefix}-cuda-memory")
+        + "</section>"
+        + '<section><h2>GPU and host telemetry</h2>'
+        + _figure_html(system_metrics_figure(workers), f"{prefix}-system-metrics")
+        + "</section>"
+        + '<section><h2>Top CPU operators</h2>'
+        + _figure_html(operator_figure(workers, "cpu", "CPU operators"), f"{prefix}-cpu-ops")
+        + "</section>"
+        + '<section><h2>Top GPU kernels</h2>'
+        + _figure_html(operator_figure(workers, "gpu", "GPU kernels"), f"{prefix}-gpu-kernels")
+        + "</section>"
+        + '<section><h2>Distributed communication</h2>'
+        + _figure_html(
+            operator_figure(workers, "communication", "NCCL and distributed operations"),
+            f"{prefix}-communication",
+        )
         + "</section>"
         + '<section><h2>Ranks and raw traces</h2><div class="table-wrap"><table><thead><tr>'
         + "<th>Rank</th><th>Steps</th><th>Mean step</th><th>P95 step</th><th>Peak CUDA</th>"
         + "<th>Checkpoints</th><th>Artifacts</th></tr></thead><tbody>"
-        + _worker_table(workers, output_file)
+        + _worker_table(workers, page)
         + "</tbody></table></div></section>"
         + '<section><h2>Checkpoint events</h2><div class="table-wrap"><table><thead><tr>'
-        + "<th>Worker</th><th>Step</th><th>Tag</th><th>Duration</th><th>Directory</th>"
+        + "<th>Worker</th><th>Step</th><th>Tag</th><th>Duration</th><th>Size</th>"
+        + "<th>Files</th><th>Throughput</th><th>Directory</th>"
         + "</tr></thead><tbody>"
         + _checkpoint_table(workers)
         + "</tbody></table></div></section>"
@@ -677,6 +857,20 @@ def write_node_page(host, workers, spans, resource_spans, output_file, run_id):
         + "<th>Step</th><th>Status</th></tr></thead><tbody>"
         + _slow_span_table(host_spans)
         + "</tbody></table></div></section>"
+        + ("</div>" if heading else "")
+    )
+    return body
+
+
+def write_node_page(host, workers, spans, resource_spans, output_file, run_id):
+    body = node_body(
+        host,
+        workers,
+        spans,
+        resource_spans,
+        output_file,
+        run_id,
+        safe_name(host),
     )
     nav = '<nav><a href="../index.html">Aggregate trace</a></nav>'
     output_file.write_text(
@@ -709,10 +903,23 @@ def build_dashboard(data_dir, output_file):
     for worker in workers:
         by_host[worker["host"]].append(worker)
     node_links = []
+    node_sections = []
     for host, host_workers in sorted(by_host.items()):
         node_page = nodes_dir / f"{safe_name(host)}.html"
         write_node_page(host, host_workers, spans, resource_spans, node_page, run_id)
-        node_links.append(f'<a href="nodes/{node_page.name}">{html.escape(host)} detail</a>')
+        node_links.append(f'<a href="#node-{safe_name(host)}">{html.escape(host)} detail</a>')
+        node_sections.append(
+            node_body(
+                host,
+                host_workers,
+                spans,
+                resource_spans,
+                output_file,
+                run_id,
+                f"standalone-{safe_name(host)}",
+                heading=True,
+            )
+        )
 
     all_steps = [step for worker in workers for step in worker["steps"]]
     durations = [float(step.get("duration_ms") or 0) for step in all_steps]
@@ -721,6 +928,16 @@ def build_dashboard(data_dir, output_file):
         default=0,
     )
     trace_duration = max((span["end_s"] for span in spans), default=0.0)
+    cpu_events = sum(worker["operator_summary"]["counts"]["cpu"] for worker in workers)
+    gpu_events = sum(worker["operator_summary"]["counts"]["gpu"] for worker in workers)
+    communication_events = sum(
+        worker["operator_summary"]["counts"]["communication"] for worker in workers
+    )
+    checkpoint_bytes = sum(
+        float(checkpoint.get("checkpoint_size_bytes") or 0)
+        for worker in workers
+        for checkpoint in worker["checkpoints"]
+    )
     body = (
         '<div class="metrics">'
         + _cards(
@@ -732,6 +949,10 @@ def build_dashboard(data_dir, output_file):
                 ("P95 step", f"{_percentile(durations, 0.95):.3f} ms"),
                 ("Peak CUDA", f"{peak / 1024**3:.3f} GiB"),
                 ("Checkpoints", sum(len(worker["checkpoints"]) for worker in workers)),
+                ("Checkpoint data", f"{checkpoint_bytes / 1024**3:.3f} GiB"),
+                ("CPU operators", f"{cpu_events:,}"),
+                ("GPU kernels", f"{gpu_events:,}"),
+                ("Communication ops", f"{communication_events:,}"),
             ]
         )
         + "</div>"
@@ -750,18 +971,34 @@ def build_dashboard(data_dir, output_file):
         + '<section><h2>Checkpoint performance</h2>'
         + _figure_html(checkpoint_figure(workers), "checkpoint-performance")
         + "</section>"
+        + '<section><h2>GPU and host telemetry</h2>'
+        + _figure_html(system_metrics_figure(workers), "aggregate-system-metrics")
+        + "</section>"
+        + '<section><h2>Top CPU operators</h2>'
+        + _figure_html(operator_figure(workers, "cpu", "CPU operators"), "aggregate-cpu-ops")
+        + "</section>"
+        + '<section><h2>Top GPU kernels</h2>'
+        + _figure_html(operator_figure(workers, "gpu", "GPU kernels"), "aggregate-gpu-kernels")
+        + "</section>"
+        + '<section><h2>Distributed communication</h2>'
+        + _figure_html(
+            operator_figure(workers, "communication", "NCCL and distributed operations"),
+            "aggregate-communication",
+        )
+        + "</section>"
         + '<section><h2>Slow-span explorer</h2><div class="table-wrap"><table><thead><tr>'
         + "<th>Start</th><th>Duration</th><th>Worker</th><th>Category</th><th>Operation</th>"
         + "<th>Step</th><th>Status</th></tr></thead><tbody>"
         + _slow_span_table(spans)
         + "</tbody></table></div></section>"
+        + "".join(node_sections)
     )
     output_file.write_text(
         _document(
             "Aggregate Trace Explorer",
             f"{workers[0]['model']} | {run_id} | wall-clock aligned across nodes",
             body,
-            "plotly.min.js",
+            inline_plotly=True,
         ),
         encoding="utf-8",
     )
@@ -791,11 +1028,16 @@ def upload_visualization(source, bucket_name, prefix, client=None):
 
     bucket = client.bucket(bucket_name)
     files = visualization_files(source)
+    report_object = f"{prefix.strip('/')}/index.html"
     for path in files:
         object_name = f"{prefix.strip('/')}/{path.relative_to(source).as_posix()}"
         content_type, _ = mimetypes.guess_type(path.name)
+        blob = bucket.blob(object_name)
+        if path.suffix == ".html":
+            blob.content_disposition = "inline"
+            blob.cache_control = "no-cache"
         try:
-            bucket.blob(object_name).upload_from_filename(path, content_type=content_type)
+            blob.upload_from_filename(path, content_type=content_type)
         except Exception as exc:
             if getattr(exc, "code", None) == 403:
                 raise SystemExit(
@@ -805,6 +1047,10 @@ def upload_visualization(source, bucket_name, prefix, client=None):
             raise
         print(f"Uploaded gs://{bucket_name}/{object_name}")
     print(f"Uploaded {len(files)} file(s) to gs://{bucket_name}/{prefix.strip('/')}/")
+    authenticated_url = (
+        f"https://storage.cloud.google.com/{bucket_name}/{quote(report_object, safe='/')}"
+    )
+    print(f"Standalone report: {authenticated_url}")
 
 
 class TraceHandler(SimpleHTTPRequestHandler):
