@@ -23,9 +23,8 @@ make doctor
 This pins the latest PyPI versions checked on 2026-07-28:
 
 ```text
-torch==2.13.0
+torch==2.13.0+cu126
 deepspeed==0.19.3
-nvidia-cuda-nvcc
 ```
 
 PyTorch 2.13 requires Python 3.10 or newer.
@@ -34,15 +33,50 @@ PyTorch 2.13 requires Python 3.10 or newer.
 
 Recommended: start from a Google Cloud Deep Learning VM image with PyTorch/GPU support. Those images are built for ML workloads and avoid most driver/CUDA setup work.
 
+If you use a plain Linux VM, choose a supported OS image. Use Ubuntu 24.04 LTS, Ubuntu 22.04 LTS, Debian 13, or Debian 12. Avoid newer preview/non-LTS images such as Ubuntu 26.04 because Google's GPU installer may fail with errors like `KeyError: '2604'`.
+
 On the VM:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y git gh make python3 python3-venv python3-pip build-essential libaio-dev
+lspci | grep -i nvidia
 nvidia-smi
 ```
 
-If `nvidia-smi` is missing or cannot see the GPU, install/repair the NVIDIA driver first using Google Cloud's GPU driver instructions, then reboot the VM and rerun `nvidia-smi`.
+If `lspci` does not show NVIDIA hardware, the VM does not have a GPU attached.
+
+If `nvidia-smi` is missing or cannot see the GPU, install the GCP NVIDIA driver, reboot, and verify:
+
+```bash
+curl -L https://storage.googleapis.com/compute-gpu-installation-us/installer/latest/cuda_installer.pyz --output cuda_installer.pyz
+sudo python3 cuda_installer.pyz install_driver --installation-mode=repo
+```
+
+Only reboot after the installer finishes successfully:
+
+```bash
+sudo reboot
+```
+
+After reconnecting:
+
+```bash
+nvidia-smi
+```
+
+Install the CUDA 12.6 toolkit for DeepSpeed's compiler checks:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y cuda-toolkit-12-6
+echo 'export CUDA_HOME=/usr/local/cuda-12.6' >> ~/.bashrc
+echo 'export PATH=$CUDA_HOME/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+nvcc --version
+```
+
+This repo installs `torch==2.13.0+cu126`, which works with GCP T4 driver stacks that report CUDA 12.8 in `nvidia-smi`.
 
 Then clone this repo and run:
 

@@ -3,7 +3,8 @@
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 DEEPSPEED ?= $(VENV)/bin/deepspeed
-CUDA_HOME ?= $(shell if [ -n "$$CUDA_HOME" ]; then echo "$$CUDA_HOME"; elif [ -d /usr/local/cuda ]; then echo /usr/local/cuda; else $(PYTHON) -c "import pathlib, site; print(pathlib.Path(site.getsitepackages()[0]) / 'nvidia' / 'cu13')" 2>/dev/null; fi)
+CUDA_HOME ?= $(shell if [ -n "$$CUDA_HOME" ]; then echo "$$CUDA_HOME"; elif [ -d /usr/local/cuda ]; then echo /usr/local/cuda; elif [ -d /usr/local/cuda-12.6 ]; then echo /usr/local/cuda-12.6; elif [ -d /usr/local/cuda-12.8 ]; then echo /usr/local/cuda-12.8; fi)
+CUDA_ENV = $(if $(CUDA_HOME),CUDA_HOME=$(CUDA_HOME) PATH=$(CUDA_HOME)/bin:$$PATH,)
 GPUS ?= 1
 HOSTFILE ?= hostfile
 MODEL ?= tiny_gpt
@@ -22,19 +23,20 @@ doctor:
 	$(PYTHON) -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), 'cuda_version', torch.version.cuda, 'gpu_count', torch.cuda.device_count())"
 	$(DEEPSPEED) --version
 	nvidia-smi
+	nvcc --version
 
 hostfile-local:
 	printf "localhost slots=%s\n" "$$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" > $(HOSTFILE)
 	cat $(HOSTFILE)
 
 train:
-	CUDA_HOME=$(CUDA_HOME) PATH=$(CUDA_HOME)/bin:$$PATH $(DEEPSPEED) --num_gpus $(GPUS) train.py --model_name $(MODEL) --steps $(STEPS)
+	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) train.py --model_name $(MODEL) --steps $(STEPS)
 
 train-hostfile-local:
-	CUDA_HOME=$(CUDA_HOME) PATH=$(CUDA_HOME)/bin:$$PATH $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
 
 train-multinode:
-	CUDA_HOME=$(CUDA_HOME) PATH=$(CUDA_HOME)/bin:$$PATH $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
 
 test:
 	$(PYTHON) -m pytest -q
