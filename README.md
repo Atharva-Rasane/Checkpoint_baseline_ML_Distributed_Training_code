@@ -76,6 +76,14 @@ source ~/.bashrc
 nvcc --version
 ```
 
+`nvidia-smi` only proves that the GPU driver is installed. DeepSpeed also checks for the CUDA compiler at `$CUDA_HOME/bin/nvcc`. If training fails with `No such file or directory: '/usr/local/cuda-12.6/bin/nvcc'`, the toolkit is missing or `CUDA_HOME` points to the wrong directory. Check with:
+
+```bash
+which nvcc || true
+ls -ld /usr/local/cuda*
+dpkg -l | grep cuda-toolkit
+```
+
 This repo installs `torch==2.13.0+cu126`, which works with GCP T4 driver stacks that report CUDA 12.8 in `nvidia-smi`.
 
 Then clone this repo and run:
@@ -84,9 +92,10 @@ Then clone this repo and run:
 make setup
 make doctor
 make check
-make hostfile-local
 make train-hostfile-local MODEL=tiny_gpt STEPS=2
 ```
+
+`train-hostfile-local` detects the VM's GPU count and creates the local hostfile automatically.
 
 `make doctor` should show:
 
@@ -100,7 +109,6 @@ On a single GCP GPU VM:
 ```bash
 make setup
 make doctor
-make hostfile-local
 make train-hostfile-local MODEL=tiny_gpt STEPS=2
 ```
 

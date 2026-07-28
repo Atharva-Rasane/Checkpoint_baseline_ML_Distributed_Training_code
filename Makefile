@@ -1,4 +1,4 @@
-.PHONY: setup install doctor hostfile-local train train-hostfile-local train-multinode test lint check clean
+.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode test lint check clean
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
@@ -18,24 +18,28 @@ setup:
 
 install: setup
 
-doctor:
+cuda-check:
+	@test -n "$(CUDA_HOME)" || (echo "CUDA_HOME is not set and no /usr/local/cuda* directory was found. Install cuda-toolkit-12-6 or set CUDA_HOME=/path/to/cuda."; exit 1)
+	@test -x "$(CUDA_HOME)/bin/nvcc" || (echo "Missing nvcc at $(CUDA_HOME)/bin/nvcc. Install cuda-toolkit-12-6 or set CUDA_HOME to the CUDA toolkit root."; exit 1)
+
+doctor: cuda-check
 	$(PYTHON) --version
 	$(PYTHON) -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), 'cuda_version', torch.version.cuda, 'gpu_count', torch.cuda.device_count())"
 	$(DEEPSPEED) --version
 	nvidia-smi
-	nvcc --version
+	$(CUDA_HOME)/bin/nvcc --version
 
 hostfile-local:
 	printf "localhost slots=%s\n" "$$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" > $(HOSTFILE)
 	cat $(HOSTFILE)
 
-train:
+train: cuda-check
 	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) train.py --model_name $(MODEL) --steps $(STEPS)
 
-train-hostfile-local:
+train-hostfile-local: cuda-check hostfile-local
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
 
-train-multinode:
+train-multinode: cuda-check
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) train.py --model_name $(MODEL) --steps $(STEPS)
 
 test:

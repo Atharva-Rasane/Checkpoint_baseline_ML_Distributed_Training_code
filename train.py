@@ -53,6 +53,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def initialize_engine(deepspeed, args, model, loader):
+    return deepspeed.initialize(
+        args=args,
+        model=model,
+        model_parameters=model.parameters(),
+        training_data=loader,
+    )
+
+
 def main():
     import deepspeed
 
@@ -66,13 +75,7 @@ def main():
     dataset = RandomTokenDataset(args.dataset_samples, args.seq_len, args.vocab_size)
     loader = DataLoader(dataset, batch_size=None, shuffle=False)
 
-    engine, _, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=model.parameters(),
-        training_data=loader,
-        config=args.deepspeed_config,
-    )
+    engine, _, _, _ = initialize_engine(deepspeed, args, model, loader)
 
     engine.train()
     data_iter = iter(engine.training_dataloader)
