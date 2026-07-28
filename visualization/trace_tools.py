@@ -38,8 +38,11 @@ OPERATION_COLORS = {
     "Backward": "#d55e00",
     "Optimizer step": "#009e73",
     "Save checkpoint": "#cc79a7",
-    "Async checkpoint staging": "#b45309",
-    "Async checkpoint persistence": "#7c3aed",
+    "Synchronous checkpoint save pipeline": "#cc79a7",
+    "Checkpoint state snapshot to host DRAM": "#b45309",
+    "Observed GPU to host DRAM copy": "#0072b2",
+    "Checkpoint CPU serialization": "#7c3aed",
+    "Checkpoint DRAM to SSD write": "#e36a2e",
     "Async checkpoint commit wait": "#dc2626",
     "Full step": "#2563eb",
 }
@@ -164,6 +167,16 @@ def _iso_from_ns(value):
     )
 
 
+def _is_device_to_host_copy(name, category):
+    if str(category).lower() != "gpu_memcpy":
+        return False
+    normalized = re.sub(r"[_-]+", " ", str(name).lower())
+    return any(
+        marker in normalized
+        for marker in ("dtoh", "d2h", "device to host", "device-to-host")
+    )
+
+
 def summarize_operator_trace(path):
     summary = {
         "cpu": Counter(),
@@ -173,6 +186,7 @@ def summarize_operator_trace(path):
         "memory_peak_bytes": 0,
         "memory_events": 0,
         "timeline_events": [],
+        "checkpoint_copies": [],
     }
     try:
         base_time_ns = None
@@ -184,6 +198,7 @@ def summarize_operator_trace(path):
                     break
 
         timeline_heaps = {"CPU": [], "GPU": [], "Communication": []}
+        checkpoint_copy_heap = []
         sequence = 0
         with path.open("rb") as trace_file:
             for event in ijson.items(trace_file, "traceEvents.item"):
@@ -219,6 +234,7 @@ def summarize_operator_trace(path):
                     trace_timestamp_us = float(event.get("ts") or 0)
                     timeline_event = {
                         "name": name,
+                        "category": category,
                         "resource": resource_name,
                         "duration_us": duration_us,
                         "start_ns": (
@@ -235,6 +251,11 @@ def summarize_operator_trace(path):
                         heapq.heappush(timeline_heap, item)
                     elif duration_us > timeline_heap[0][0]:
                         heapq.heapreplace(timeline_heap, item)
+                    if _is_device_to_host_copy(name, category):
+                        if len(checkpoint_copy_heap) < 5000:
+                            heapq.heappush(checkpoint_copy_heap, item)
+                        elif duration_us > checkpoint_copy_heap[0][0]:
+                            heapq.heapreplace(checkpoint_copy_heap, item)
                     sequence += 1
                 if name == "[memory]":
                     args = event.get("args") or {}
@@ -252,6 +273,16 @@ def summarize_operator_trace(path):
                     for timeline_heap in timeline_heaps.values()
                     for item in timeline_heap
                 ],
+                key=lambda item: (
+                    item[2]["start_ns"] or item[2]["trace_timestamp_us"],
+                    item[1],
+                ),
+            )
+        ]
+        summary["checkpoint_copies"] = [
+            item[2]
+            for item in sorted(
+                checkpoint_copy_heap,
                 key=lambda item: (
                     item[2]["start_ns"] or item[2]["trace_timestamp_us"],
                     item[1],
@@ -493,6 +524,80 @@ def build_resource_spans(workers, logical_spans):
                     }
                 )
                 worker_resource_count += 1
+        checkpoint_windows = [
+            span
+            for span in logical_spans
+            if span["worker"] == worker["worker"]
+            and span["category"] == "Checkpoint"
+            and any(
+                marker in span["operation"].lower()
+                for marker in (
+                    "snapshot to host dram",
+                    "async checkpoint staging",
+                    "synchronous checkpoint save pipeline",
+                    "save checkpoint",
+                )
+            )
+        ]
+        for copy_event in worker["operator_summary"].get("checkpoint_copies", []):
+            copy_start_ns = copy_event.get("start_ns")
+            if copy_start_ns is None:
+                worker_start_ns = _timestamp_ns(worker["started_at"])
+                if worker_start_ns is None:
+                    continue
+                copy_start_ns = worker_start_ns + int(
+                    float(copy_event.get("trace_timestamp_us") or 0) * 1000
+                )
+            copy_start_ns = int(copy_start_ns)
+            duration_us = max(0.0, float(copy_event.get("duration_us") or 0))
+            copy_end_ns = copy_start_ns + int(duration_us * 1000)
+            window = next(
+                (
+                    span
+                    for span in checkpoint_windows
+                    if span.get("start_ns") is not None
+                    and copy_start_ns < int(span["end_ns"])
+                    and copy_end_ns > int(span["start_ns"])
+                ),
+                None,
+            )
+            if window is None:
+                continue
+            resource_spans.append(
+                {
+                    "schema_version": 2,
+                    "event": "resource_span",
+                    "category": "Checkpoint",
+                    "operation": "Observed GPU to host DRAM copy",
+                    "phase": "Observed GPU to host DRAM copy",
+                    "resource": "GPU",
+                    "worker": worker["worker"],
+                    "host": worker["host"],
+                    "job": worker["job"],
+                    "rank": worker["rank"],
+                    "world_size": worker["world_size"],
+                    "step": window.get("step", "-"),
+                    "tag": window.get("tag", "-"),
+                    "checkpoint_mode": window.get(
+                        "checkpoint_mode", worker["checkpoint_mode"]
+                    ),
+                    "source_operator": copy_event["name"],
+                    "measurement": "kineto_gpu_memcpy",
+                    "start_alignment": "kineto_absolute_timestamp",
+                    "start_is_estimated": False,
+                    "start_ns": copy_start_ns,
+                    "end_ns": copy_end_ns,
+                    "resource_start_ns": copy_start_ns,
+                    "resource_end_ns": copy_end_ns,
+                    "start_s": (copy_start_ns - base_ns) / 1_000_000_000,
+                    "duration_s": duration_us / 1_000_000,
+                    "end_s": (copy_end_ns - base_ns) / 1_000_000_000,
+                    "start_epoch_s": copy_start_ns / 1_000_000_000,
+                    "end_epoch_s": copy_end_ns / 1_000_000_000,
+                    "start_utc": _iso_from_ns(copy_start_ns),
+                    "end_utc": _iso_from_ns(copy_end_ns),
+                }
+            )
         if worker_resource_count == 0:
             resource_spans.extend(
                 {
@@ -545,10 +650,22 @@ def _resource_measurement_summary(row):
         if row.get("device_kernel_count") is not None:
             details.append(f"direct kernels={int(row['device_kernel_count'])}")
         return ", ".join(details)
+    if row.get("resource") == "Storage":
+        details = [f"in-flight window={row['duration_s'] * 1000:.3f}ms"]
+        if row.get("checkpoint_storage_write_bytes") is not None:
+            details.append(
+                "process write_bytes delta="
+                f"{int(row['checkpoint_storage_write_bytes']) / 1024**2:.3f}MiB"
+            )
+        if row.get("checkpoint_size_bytes") is not None:
+            details.append(
+                f"checkpoint size={int(row['checkpoint_size_bytes']) / 1024**2:.3f}MiB"
+            )
+        return ", ".join(details)
     return f"elapsed={row['duration_s'] * 1000:.3f}ms"
 
 
-def resource_timeline(spans, host):
+def resource_timeline(spans, host, title=None):
     figure = go.Figure()
 
     def lane_name(span):
@@ -647,7 +764,7 @@ def resource_timeline(spans, host):
             )
         )
     layout = _layout(
-        f"{host} forward/backward CPU and GPU phase timeline",
+        title or f"{host} forward/backward CPU and GPU phase timeline",
         max(500, 48 * len(lanes) + 210),
     )
     layout.update(
@@ -1794,6 +1911,11 @@ def node_body(
 ):
     host_spans = [span for span in spans if span["host"] == host]
     host_resource_spans = [span for span in resource_spans if span["host"] == host]
+    host_checkpoint_resource_spans = [
+        span
+        for span in host_resource_spans
+        if span.get("category") == "Checkpoint"
+    ]
     all_steps = [step for worker in workers for step in worker["steps"]]
     durations = [float(step.get("duration_ms") or 0) for step in all_steps]
     peak = max(
@@ -1902,7 +2024,18 @@ def node_body(
         + "<th>Checkpoints</th><th>Artifacts</th></tr></thead><tbody>"
         + _worker_table(workers, page)
         + "</tbody></table></div></section>"
-        + f'<section id="{prefix}-checkpoint-events"><h2>Checkpoint events</h2><div class="table-wrap"><table><thead><tr>'
+        + f'<section id="{prefix}-checkpoint-events">'
+        + _timeline_panel(
+            "Checkpoint data path",
+            "Observed GPU-to-host copies, host snapshot and CPU serialization windows, DRAM-to-SSD persistence, and commit waits on one UTC axis.",
+            resource_timeline(
+                host_checkpoint_resource_spans,
+                host,
+                f"{host} checkpoint data path",
+            ),
+            f"{prefix}-checkpoint-data-path",
+        )
+        + '<h2>Checkpoint events</h2><div class="table-wrap"><table><thead><tr>'
         + "<th>Worker</th><th>Step</th><th>Tag</th><th>Mode</th><th>Total</th>"
         + "<th>Staging</th><th>Background</th><th>Size</th>"
         + "<th>Files</th><th>Throughput</th><th>Directory</th>"
@@ -2133,7 +2266,22 @@ def build_dashboard(data_dir, output_file):
             "aggregate-communication",
         )
         + "</section>"
-        + '<section id="checkpointing"><h2>Checkpoint performance</h2>'
+        + '<section id="checkpointing">'
+        + _timeline_panel(
+            "Checkpoint data path across all ranks",
+            "Only Kineto-observed GPU-to-host copies are shown; CPU serialization and storage bars are bounded in-flight windows from staging completion through checkpoint commit.",
+            resource_timeline(
+                [
+                    span
+                    for span in resource_spans
+                    if span.get("category") == "Checkpoint"
+                ],
+                "All nodes",
+                "All nodes checkpoint data path",
+            ),
+            "aggregate-checkpoint-data-path",
+        )
+        + '<h2>Checkpoint performance</h2>'
         + _figure_html(checkpoint_figure(workers), "checkpoint-performance")
         + '<div class="table-wrap"><table><thead><tr>'
         + "<th>Worker</th><th>Step</th><th>Tag</th><th>Mode</th><th>Total</th>"

@@ -183,21 +183,24 @@ class TrainingTrace:
                     "world_size": self.world_size,
                     **metadata,
                 }
-                cpu = {
+                primary_resource = metadata.get("resource_override", "CPU")
+                primary = {
                     **common,
-                    "resource": "CPU",
+                    "resource": primary_resource,
                     "resource_start_ns": metadata["start_ns"],
                     "resource_end_ns": metadata["end_ns"],
                     "duration_ms": cpu_wall_ms,
-                    "cpu_wall_ms": cpu_wall_ms,
+                    "cpu_wall_ms": (
+                        cpu_wall_ms if primary_resource == "CPU" else None
+                    ),
                     "profiler_cpu_total_ms": (
                         float(profiler_span.cpu_time_total) / 1000
-                        if profiler_span is not None
+                        if profiler_span is not None and primary_resource == "CPU"
                         else None
                     ),
                     "profiler_self_cpu_ms": (
                         float(profiler_span.self_cpu_time_total) / 1000
-                        if profiler_span is not None
+                        if profiler_span is not None and primary_resource == "CPU"
                         else None
                     ),
                     "measurement": metadata.get(
@@ -206,8 +209,10 @@ class TrainingTrace:
                     "start_alignment": "observed_wall_clock",
                     "start_is_estimated": False,
                 }
-                resource_file.write(json.dumps(cpu, sort_keys=True) + "\n")
-                if cuda_events is not None:
+                resource_file.write(json.dumps(primary, sort_keys=True) + "\n")
+                if cuda_events is not None and metadata.get(
+                    "emit_gpu_resource", True
+                ):
                     gpu_duration_ms = float(cuda_events[0].elapsed_time(cuda_events[1]))
                     gpu_start_ns = metadata["start_ns"]
                     gpu = {
@@ -222,9 +227,7 @@ class TrainingTrace:
                             if profiler_span is not None
                             else None
                         ),
-                        "device_kernel_count": (
-                            kernel_count(profiler_span)
-                        ),
+                        "device_kernel_count": kernel_count(profiler_span),
                         "measurement": "cuda_stream_elapsed",
                         "start_alignment": "enclosing_cpu_phase_start",
                         "start_is_estimated": True,
@@ -281,6 +284,23 @@ def directory_stats(path):
         return file_count, total_bytes
     except OSError:
         return 0, 0
+
+
+def process_io_counters(pid):
+    if not pid:
+        return {}
+    try:
+        return {
+            key.rstrip(":"): int(value)
+            for key, value in (
+                line.split(maxsplit=1)
+                for line in Path(f"/proc/{pid}/io")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+        }
+    except (OSError, ValueError):
+        return {}
 
 
 def _default_network_interface():
@@ -534,21 +554,49 @@ def finish_async_checkpoint(engine, trace, pending, output_dir, rank, force=Fals
 
     completed_ns = time.time_ns()
     persistence_start_ns = pending["staged_ns"]
-    trace.record_span(
-        "Checkpoint",
-        "Async checkpoint persistence",
-        persistence_start_ns,
-        completed_ns,
-        step=pending["step"],
-        tag=pending["tag"],
-        checkpoint_mode="asynchronous",
-        checkpoint_worker_pid=pending["worker_pid"],
-        resource_measurement="background_checkpoint_process_wall_clock",
-    )
     total_duration_ms = (completed_ns - pending["request_ns"]) / 1_000_000
     persistence_duration_ms = (completed_ns - persistence_start_ns) / 1_000_000
     checkpoint_files, checkpoint_bytes = (
         directory_stats(Path(output_dir) / pending["tag"]) if rank == 0 else (0, 0)
+    )
+    completed_io = process_io_counters(pending["worker_pid"])
+    storage_write_bytes = None
+    initial_io = pending.get("worker_io", {})
+    if "write_bytes" in initial_io and "write_bytes" in completed_io:
+        storage_write_bytes = max(
+            0,
+            completed_io["write_bytes"] - initial_io["write_bytes"],
+        )
+    checkpoint_throughput_mib_s = (
+        checkpoint_bytes / 1024**2 / (persistence_duration_ms / 1000)
+        if persistence_duration_ms > 0
+        else 0
+    )
+    background_values = {
+        "step": pending["step"],
+        "tag": pending["tag"],
+        "checkpoint_mode": "asynchronous",
+        "checkpoint_worker_pid": pending["worker_pid"],
+        "checkpoint_size_bytes": checkpoint_bytes,
+        "checkpoint_storage_write_bytes": storage_write_bytes,
+        "checkpoint_throughput_mib_s": checkpoint_throughput_mib_s,
+    }
+    trace.record_span(
+        "Checkpoint",
+        "Checkpoint CPU serialization",
+        persistence_start_ns,
+        completed_ns,
+        resource_measurement="background_checkpoint_in_flight_wall_clock",
+        **background_values,
+    )
+    trace.record_span(
+        "Checkpoint",
+        "Checkpoint DRAM to SSD write",
+        persistence_start_ns,
+        completed_ns,
+        resource_override="Storage",
+        resource_measurement="checkpoint_storage_in_flight_wall_clock",
+        **background_values,
     )
     trace.log(
         "checkpoint_complete",
@@ -562,11 +610,8 @@ def finish_async_checkpoint(engine, trace, pending, output_dir, rank, force=Fals
         persistence_duration_ms=persistence_duration_ms,
         checkpoint_file_count=checkpoint_files,
         checkpoint_size_bytes=checkpoint_bytes,
-        checkpoint_throughput_mib_s=(
-            checkpoint_bytes / 1024**2 / (persistence_duration_ms / 1000)
-            if persistence_duration_ms > 0
-            else 0
-        ),
+        checkpoint_storage_write_bytes=storage_write_bytes,
+        checkpoint_throughput_mib_s=checkpoint_throughput_mib_s,
     )
     return None
 
@@ -583,10 +628,12 @@ def start_async_checkpoint(engine, trace, step, output_dir):
     )
     with trace.span(
         "Checkpoint",
-        "Async checkpoint staging",
+        "Checkpoint state snapshot to host DRAM",
         step=step,
         tag=tag,
         checkpoint_mode="asynchronous",
+        resource_measurement="checkpoint_state_snapshot_wall_clock",
+        emit_gpu_resource=False,
     ):
         engine.save_checkpoint(output_dir, tag=tag)
     staged_ns = time.time_ns()
@@ -609,6 +656,7 @@ def start_async_checkpoint(engine, trace, step, output_dir):
         "staged_ns": staged_ns,
         "staging_duration_ms": staging_duration_ms,
         "worker_pid": worker_pid,
+        "worker_io": process_io_counters(worker_pid),
     }
 
 
@@ -762,6 +810,7 @@ def main(checkpoint_mode="synchronous"):
                     )
                 else:
                     checkpoint_started = time.perf_counter()
+                    checkpoint_started_ns = time.time_ns()
                     tag = f"step-{step}"
                     trace.log(
                         "checkpoint_start",
@@ -772,12 +821,15 @@ def main(checkpoint_mode="synchronous"):
                     )
                     with trace.span(
                         "Checkpoint",
-                        "Save checkpoint",
+                        "Synchronous checkpoint save pipeline",
                         step=step,
                         tag=tag,
                         checkpoint_mode="synchronous",
+                        resource_measurement="synchronous_checkpoint_wall_clock",
+                        emit_gpu_resource=False,
                     ):
                         engine.save_checkpoint(args.output_dir, tag=tag)
+                    checkpoint_completed_ns = time.time_ns()
                     checkpoint_duration_ms = (
                         time.perf_counter() - checkpoint_started
                     ) * 1000
@@ -785,6 +837,20 @@ def main(checkpoint_mode="synchronous"):
                         directory_stats(Path(args.output_dir) / tag)
                         if rank == 0
                         else (0, 0)
+                    )
+                    trace.record_span(
+                        "Checkpoint",
+                        "Checkpoint DRAM to SSD write",
+                        checkpoint_started_ns,
+                        checkpoint_completed_ns,
+                        step=step,
+                        tag=tag,
+                        checkpoint_mode="synchronous",
+                        checkpoint_size_bytes=checkpoint_bytes,
+                        resource_override="Storage",
+                        resource_measurement=(
+                            "synchronous_checkpoint_pipeline_wall_clock"
+                        ),
                     )
                     trace.log(
                         "checkpoint_complete",

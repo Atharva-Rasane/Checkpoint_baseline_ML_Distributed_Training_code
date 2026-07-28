@@ -162,7 +162,9 @@ make train-async-hostfile-local MODEL=tiny_gpt STEPS=16 SAVE_EVERY=2 TRACE=1
 make upload
 ```
 
-Asynchronous checkpoints are written under `checkpoints/asynchronous/`. The trace shows `Async checkpoint staging`, `Async checkpoint persistence`, and any `Async checkpoint commit wait` on the CPU lane. When checkpointing overlaps training, that CPU row is split into checkpoint and training half-height strips instead of blending the bars. Only one checkpoint is kept in flight because DeepSpeed exposes one pending commit at a time.
+Asynchronous checkpoints are written under `checkpoints/asynchronous/`. The checkpoint data-path timeline breaks each save into `Checkpoint state snapshot to host DRAM`, Kineto-observed `Observed GPU to host DRAM copy` events, `Checkpoint CPU serialization`, `Checkpoint DRAM to SSD write`, and any `Async checkpoint commit wait`. CPU checkpoint work and training use separate half-height strips when they overlap; storage has its own lane.
+
+GPU-to-host bars are emitted only for device-to-host memcpy events actually recorded by Kineto inside a checkpoint staging window. This repo offloads ZeRO-3 parameters and optimizer state to CPU, so a checkpoint may already start in host DRAM and show no GPU-to-host checkpoint copy. The asynchronous writer is a separate process outside the parent Kineto session: its CPU serialization and SSD bars therefore show the measured staging-complete-to-commit in-flight window, not invented active-operation boundaries. The storage detail includes the writer process's Linux `write_bytes` delta when `/proc/<pid>/io` is available. Only one checkpoint is kept in flight because DeepSpeed exposes one pending commit at a time.
 
 The configured `gradient_accumulation_steps` is `8`. The training loop calls `engine.step()` after every forward/backward microbatch, but DeepSpeed applies a real optimizer parameter update only at each eighth microbatch. On one GPU the effective batch per update is `2 microbatch samples x 8 accumulation steps = 16 samples`; with multiple data-parallel GPUs it is also multiplied by the GPU count. This is why the detailed trace shows the substantive optimizer update every eight iterations.
 
@@ -190,7 +192,7 @@ The hardware profile records CPU and RAM capacity, GPU model/memory/compute capa
 
 Each rank writes wall-clock-aligned job spans, separate wall-clock CPU and CUDA-event GPU resource spans, an operator timeline, graph execution trace, step metrics, GPU memory, and checkpoint events below `visualization/traces/<run-id>/<host>/rank-<rank>/`.
 
-`resource-trace.jsonl` uses a versioned per-phase resource schema. It records explicit CPU/GPU start and end fields, CPU wall and profiler timing, GPU stream and kernel timing, kernel counts, and whether a resource start is observed or estimated. Perfetto remains the exact source for individual operator and GPU-kernel placement.
+`resource-trace.jsonl` uses a versioned per-phase resource schema. It records explicit CPU/GPU/storage start and end fields, CPU wall and profiler timing, GPU stream and kernel timing, kernel counts, checkpoint size and writer I/O bytes, and whether a resource start is observed or estimated. Perfetto remains the exact source for individual operator, GPU-kernel, and GPU-memcpy placement.
 
 Collect traces from every host in `hostfile` and build the dashboard:
 

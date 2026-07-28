@@ -128,12 +128,18 @@ def test_async_checkpoint_completion_records_background_cpu_span(tmp_path, monke
     assert engine.commits == 1
     assert [span[1] for span in trace.spans] == [
         "Async checkpoint commit wait",
-        "Async checkpoint persistence",
+        "Checkpoint CPU serialization",
+        "Checkpoint DRAM to SSD write",
     ]
-    persistence = trace.spans[1]
-    assert persistence[2:4] == (150, 400)
-    assert persistence[4]["resource_measurement"] == (
-        "background_checkpoint_process_wall_clock"
+    serialization, storage = trace.spans[1:]
+    assert serialization[2:4] == (150, 400)
+    assert serialization[4]["resource_measurement"] == (
+        "background_checkpoint_in_flight_wall_clock"
+    )
+    assert storage[2:4] == (150, 400)
+    assert storage[4]["resource_override"] == "Storage"
+    assert storage[4]["resource_measurement"] == (
+        "checkpoint_storage_in_flight_wall_clock"
     )
     assert trace.events[0][0] == "checkpoint_complete"
     assert trace.events[0][1]["checkpoint_mode"] == "asynchronous"
@@ -208,6 +214,19 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "duration_ms": 3,
         },
         {
+            "event": "span",
+            "host": "node",
+            "rank": 0,
+            "category": "Checkpoint",
+            "operation": "Checkpoint state snapshot to host DRAM",
+            "step": 1,
+            "tag": "step-1",
+            "checkpoint_mode": "asynchronous",
+            "start_ns": base_ns + 1_000_000,
+            "end_ns": base_ns + 3_000_000,
+            "duration_ms": 2,
+        },
+        {
             "event": "step",
             "step": 1,
             "loss": 2.5,
@@ -242,6 +261,13 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
                         "dur": 80,
                     },
                     {"ph": "X", "cat": "kernel", "name": "gemm", "ts": 200, "dur": 60},
+                    {
+                        "ph": "X",
+                        "cat": "gpu_memcpy",
+                        "name": "Memcpy DtoH (Device -> Pinned)",
+                        "ts": 1500,
+                        "dur": 200,
+                    },
                     {
                         "ph": "X",
                         "cat": "kernel",
@@ -293,26 +319,47 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             ("GPU", "cuda_event_elapsed"),
         )
     ]
-    resource_events.append(
-        {
-            "schema_version": 2,
-            "event": "resource_span",
-            "host": "node",
-            "job": "tiny_gpt",
-            "rank": 0,
-            "category": "Checkpoint",
-            "operation": "Async checkpoint persistence",
-            "resource": "CPU",
-            "start_ns": base_ns + 2_000_000,
-            "end_ns": base_ns + 14_000_000,
-            "resource_start_ns": base_ns + 2_000_000,
-            "resource_end_ns": base_ns + 14_000_000,
-            "duration_ms": 12,
-            "measurement": "background_checkpoint_process_wall_clock",
-            "start_alignment": "observed_wall_clock",
-            "start_is_estimated": False,
-            "checkpoint_worker_pid": 4321,
-        }
+    resource_events.extend(
+        [
+            {
+                "schema_version": 2,
+                "event": "resource_span",
+                "host": "node",
+                "job": "tiny_gpt",
+                "rank": 0,
+                "category": "Checkpoint",
+                "operation": "Checkpoint CPU serialization",
+                "resource": "CPU",
+                "start_ns": base_ns + 2_000_000,
+                "end_ns": base_ns + 14_000_000,
+                "resource_start_ns": base_ns + 2_000_000,
+                "resource_end_ns": base_ns + 14_000_000,
+                "duration_ms": 12,
+                "measurement": "background_checkpoint_in_flight_wall_clock",
+                "start_alignment": "observed_wall_clock",
+                "start_is_estimated": False,
+                "checkpoint_worker_pid": 4321,
+            },
+            {
+                "schema_version": 2,
+                "event": "resource_span",
+                "host": "node",
+                "job": "tiny_gpt",
+                "rank": 0,
+                "category": "Checkpoint",
+                "operation": "Checkpoint DRAM to SSD write",
+                "resource": "Storage",
+                "start_ns": base_ns + 2_000_000,
+                "end_ns": base_ns + 14_000_000,
+                "resource_start_ns": base_ns + 2_000_000,
+                "resource_end_ns": base_ns + 14_000_000,
+                "duration_ms": 12,
+                "measurement": "checkpoint_storage_in_flight_wall_clock",
+                "start_alignment": "observed_wall_clock",
+                "start_is_estimated": False,
+                "checkpoint_worker_pid": 4321,
+            },
+        ]
     )
     (worker_dir / "resource-trace.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in resource_events), encoding="utf-8"
@@ -336,8 +383,13 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert "Backward - GPU" in aggregate
     assert "Optimizer step - CPU" in aggregate
     assert "Optimizer step - GPU" in aggregate
-    assert "Async checkpoint persistence - CPU" in aggregate
-    assert "background_checkpoint_process_wall_clock" in aggregate
+    assert "Checkpoint data path across all ranks" in aggregate
+    assert "Checkpoint CPU serialization - CPU" in aggregate
+    assert "Checkpoint DRAM to SSD write - Storage" in aggregate
+    assert "Observed GPU to host DRAM copy - GPU" in aggregate
+    assert "background_checkpoint_in_flight_wall_clock" in aggregate
+    assert "checkpoint_storage_in_flight_wall_clock" in aggregate
+    assert "kineto_gpu_memcpy" in aggregate
     assert "asynchronous" in aggregate
     assert "4321" in aggregate
     assert "What happened?" in aggregate
@@ -352,6 +404,7 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert node_page.is_file()
     node_html = node_page.read_text(encoding="utf-8")
     assert "Forward/backward CPU and GPU phase timeline" in node_html
+    assert "Checkpoint data path" in node_html
     assert "CPU and GPU operation timeline" in node_html
     assert "Collective communication occupancy" in node_html
     assert "Simulator hardware profile" in node_html
@@ -439,7 +492,7 @@ def test_phase_timeline_separates_cpu_and_gpu_for_each_operation():
             )
     spans.append(
         {
-            "operation": "Async checkpoint persistence",
+            "operation": "Checkpoint CPU serialization",
             "resource": "CPU",
             "category": "Checkpoint",
             "job": "tiny_gpt",
@@ -448,7 +501,7 @@ def test_phase_timeline_separates_cpu_and_gpu_for_each_operation():
             "start_s": 0.002,
             "duration_s": 0.012,
             "start_utc": "2026-07-28T19:42:00.002+00:00",
-            "measurement": "background_checkpoint_process_wall_clock",
+            "measurement": "background_checkpoint_in_flight_wall_clock",
         }
     )
 
@@ -460,21 +513,21 @@ def test_phase_timeline_separates_cpu_and_gpu_for_each_operation():
         "Forward - GPU",
         "Backward - CPU",
         "Backward - GPU",
-        "Async checkpoint persistence - CPU",
+        "Checkpoint CPU serialization - CPU",
     }
     assert traces["Forward - CPU"].marker.pattern.shape == "/"
     assert traces["Forward - GPU"].marker.pattern.shape == ""
     assert traces["Forward - CPU"].marker.opacity < traces["Forward - GPU"].marker.opacity
     assert traces["Forward - CPU"].width[0] == 0.36
-    assert traces["Async checkpoint persistence - CPU"].width[0] == 0.36
+    assert traces["Checkpoint CPU serialization - CPU"].width[0] == 0.36
     assert traces["Forward - GPU"].width[0] == 0.68
-    assert traces["Forward - CPU"].y[0] != traces["Async checkpoint persistence - CPU"].y[0]
+    assert traces["Forward - CPU"].y[0] != traces["Checkpoint CPU serialization - CPU"].y[0]
     assert list(figure.layout.yaxis.ticktext) == [
         "tiny_gpt / rank 0 | CPU [checkpoint | training]",
         "tiny_gpt / rank 0 | GPU",
     ]
     assert traces["Forward - CPU"].customdata[0][13] == "training half"
-    assert traces["Async checkpoint persistence - CPU"].customdata[0][13] == (
+    assert traces["Checkpoint CPU serialization - CPU"].customdata[0][13] == (
         "checkpoint half"
     )
 
@@ -501,6 +554,13 @@ def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
                         "ts": 30,
                         "dur": 20,
                     },
+                    {
+                        "ph": "X",
+                        "cat": "gpu_memcpy",
+                        "name": "Memcpy DtoH",
+                        "ts": 40,
+                        "dur": 10,
+                    },
                 ],
             }
         ),
@@ -509,7 +569,7 @@ def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
 
     summary = summarize_operator_trace(trace)
 
-    assert summary["counts"] == {"cpu": 1, "gpu": 2, "communication": 1}
+    assert summary["counts"] == {"cpu": 1, "gpu": 3, "communication": 1}
     assert summary["cpu"]["aten::mm"] == 100
     assert summary["communication"]["ncclAllReduce"] == 20
     assert summary["timeline_events"][0]["start_ns"] == 1_000_010_000
@@ -518,6 +578,8 @@ def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
         "GPU",
         "Communication",
     }
+    assert summary["checkpoint_copies"][0]["name"] == "Memcpy DtoH"
+    assert summary["checkpoint_copies"][0]["category"] == "gpu_memcpy"
 
 
 def test_checkpoint_directory_stats(tmp_path):
@@ -593,7 +655,10 @@ def test_resource_trace_records_gpu_timing_provenance(tmp_path):
 
     trace._export_resource_trace()
 
-    events = [json.loads(line) for line in (tmp_path / "resource-trace.jsonl").read_text().splitlines()]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "resource-trace.jsonl").read_text().splitlines()
+    ]
     cpu, gpu = events
     assert cpu["schema_version"] == 2
     assert cpu["phase"] == "Forward"
@@ -605,6 +670,37 @@ def test_resource_trace_records_gpu_timing_provenance(tmp_path):
     assert gpu["resource_end_ns"] == 1_004_250_000
     assert gpu["start_alignment"] == "enclosing_cpu_phase_start"
     assert gpu["start_is_estimated"] is True
+
+
+def test_resource_trace_can_emit_storage_without_a_synthetic_gpu_span(tmp_path):
+    trace = TrainingTrace.__new__(TrainingTrace)
+    trace.output_dir = tmp_path
+    trace.host = "node"
+    trace.job = "tiny_gpt"
+    trace.rank = 0
+    trace.world_size = 1
+    trace.profiler = SimpleNamespace(events=list)
+    trace.span_metadata = {
+        0: {
+            "category": "Checkpoint",
+            "operation": "Checkpoint DRAM to SSD write",
+            "start_ns": 1_000_000_000,
+            "end_ns": 1_010_000_000,
+            "status": "ok",
+            "resource_override": "Storage",
+            "resource_measurement": "checkpoint_storage_in_flight_wall_clock",
+            "emit_gpu_resource": False,
+        }
+    }
+    trace.cuda_span_events = {}
+
+    trace._export_resource_trace()
+
+    event = json.loads((tmp_path / "resource-trace.jsonl").read_text())
+    assert event["resource"] == "Storage"
+    assert event["duration_ms"] == 10
+    assert event["cpu_wall_ms"] is None
+    assert event["measurement"] == "checkpoint_storage_in_flight_wall_clock"
 
 
 def test_upload_file_list_contains_dashboard_and_collected_traces(tmp_path):
