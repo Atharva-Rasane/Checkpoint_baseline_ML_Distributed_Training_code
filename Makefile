@@ -1,4 +1,4 @@
-.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode collect visualize serve test lint check clean
+.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode collect visualize serve upload test lint check clean
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
@@ -20,6 +20,8 @@ VIS_DIR ?= visualization
 REMOTE_DIR ?= $(CURDIR)
 SERVE_HOST ?= 127.0.0.1
 PORT ?= 8000
+BUCKET ?= gbc-oit-rc-basil-app-bo-training-traces
+UPLOAD_PREFIX ?= $(shell hostname)_$(shell date -u +%Y%m%d_%H%M%S)
 
 setup:
 	python3 -m venv $(VENV)
@@ -61,6 +63,9 @@ visualize: collect
 
 serve: visualize
 	$(PYTHON) $(VIS_DIR)/trace_tools.py serve --directory $(VIS_DIR) --host $(SERVE_HOST) --port $(PORT)
+
+upload: visualize
+	$(PYTHON) $(VIS_DIR)/trace_tools.py upload --source $(VIS_DIR) --bucket $(BUCKET) --prefix $(UPLOAD_PREFIX)
 
 test:
 	$(PYTHON) -m pytest -q

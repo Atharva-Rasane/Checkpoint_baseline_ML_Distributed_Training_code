@@ -188,6 +188,37 @@ gcloud compute ssh atharva-instace --zone=us-central1-b -- -L 8000:localhost:800
 
 The dashboard links operator traces to Perfetto for detailed timeline inspection. Multi-node collection uses `scp`, so the launcher VM must have passwordless SSH access to every host, as required by DeepSpeed launch.
 
+Upload the generated dashboard and all collected rank traces to the private GCS archive:
+
+```bash
+make upload
+```
+
+Uploads use a new folder named `<vm-name>_<UTC-date>_<UTC-time>`, for example:
+
+```text
+gs://gbc-oit-rc-basil-app-bo-training-traces/atharva-instace_20260728_191530/
+```
+
+`make upload` runs collection and dashboard generation first. Override the destination when needed:
+
+```bash
+make upload BUCKET=my-trace-bucket UPLOAD_PREFIX=my-run
+```
+
+The VM uses its attached service account through Application Default Credentials. A GCE VM created with a read-only Storage OAuth scope must be changed once to the `cloud-platform` scope; GCP requires the VM to be stopped for this operation:
+
+```bash
+gcloud compute instances stop atharva-instace --zone=us-central1-b
+gcloud compute instances set-service-account atharva-instace \
+  --zone=us-central1-b \
+  --service-account=790904411643-compute@developer.gserviceaccount.com \
+  --scopes=cloud-platform
+gcloud compute instances start atharva-instace --zone=us-central1-b
+```
+
+The bucket is private with public access prevention. The VM service account has object-creator access, which permits timestamped uploads without allowing it to read or delete existing archives.
+
 Development:
 
 ```bash

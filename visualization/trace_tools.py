@@ -1,5 +1,6 @@
 import argparse
 import json
+import mimetypes
 import re
 import shutil
 import socket
@@ -99,6 +100,32 @@ def build_dashboard(data_dir, output_file):
     print(f"Built {output_file} for {len(workers)} worker trace(s)")
 
 
+def visualization_files(source):
+    index = source / "index.html"
+    collected = source / "collected"
+    if not index.is_file() or not collected.is_dir():
+        raise FileNotFoundError("Visualization is incomplete; run make visualize first")
+    return [index, *(path for path in sorted(collected.rglob("*")) if path.is_file())]
+
+
+def upload_visualization(source, bucket_name, prefix, client=None):
+    if client is None:
+        try:
+            from google.cloud import storage
+        except ModuleNotFoundError as exc:
+            raise SystemExit("google-cloud-storage is missing; run make setup") from exc
+        client = storage.Client()
+
+    bucket = client.bucket(bucket_name)
+    files = visualization_files(source)
+    for path in files:
+        object_name = f"{prefix.strip('/')}/{path.relative_to(source).as_posix()}"
+        content_type, _ = mimetypes.guess_type(path.name)
+        bucket.blob(object_name).upload_from_filename(path, content_type=content_type)
+        print(f"Uploaded gs://{bucket_name}/{object_name}")
+    print(f"Uploaded {len(files)} file(s) to gs://{bucket_name}/{prefix.strip('/')}/")
+
+
 class TraceHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -167,6 +194,10 @@ def parse_args():
     serve_parser.add_argument("--directory", type=Path, default=Path("visualization"))
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
+    upload_parser = commands.add_parser("upload")
+    upload_parser.add_argument("--source", type=Path, default=Path("visualization"))
+    upload_parser.add_argument("--bucket", required=True)
+    upload_parser.add_argument("--prefix", required=True)
     return parser.parse_args()
 
 
@@ -176,8 +207,10 @@ def main():
         collect(args.hostfile, args.source, args.output, args.remote_dir)
     elif args.command == "build":
         build_dashboard(args.data, args.output)
-    else:
+    elif args.command == "serve":
         serve(args.directory, args.host, args.port)
+    else:
+        upload_visualization(args.source, args.bucket, args.prefix)
 
 
 if __name__ == "__main__":

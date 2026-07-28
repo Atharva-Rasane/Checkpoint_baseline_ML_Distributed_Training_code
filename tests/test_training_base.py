@@ -1,11 +1,17 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 from torch.utils.data import Dataset
 
 from train import RandomTokenDataset, TrainingTrace, initialize_engine, load_model
-from visualization.trace_tools import build_dashboard, read_hosts
+from visualization.trace_tools import (
+    build_dashboard,
+    read_hosts,
+    upload_visualization,
+    visualization_files,
+)
 
 
 def test_loads_model_from_llm_models_folder():
@@ -86,3 +92,41 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
     assert (worker_dir / "operator-trace.json").stat().st_size > 0
     assert (worker_dir / "execution-trace.json").stat().st_size > 0
     assert '"event": "step"' in (worker_dir / "metrics.jsonl").read_text(encoding="utf-8")
+
+
+def test_upload_file_list_contains_dashboard_and_collected_traces(tmp_path):
+    (tmp_path / "index.html").write_text("dashboard", encoding="utf-8")
+    trace = tmp_path / "collected" / "localhost" / "operator-trace.json"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("{}", encoding="utf-8")
+
+    assert visualization_files(tmp_path) == [tmp_path / "index.html", trace]
+
+
+def test_upload_uses_vm_and_timestamp_prefix(tmp_path):
+    uploaded = []
+
+    class FakeBlob:
+        def __init__(self, name):
+            self.name = name
+
+        def upload_from_filename(self, path, content_type=None):
+            uploaded.append((self.name, Path(path).name, content_type))
+
+    class FakeBucket:
+        def blob(self, name):
+            return FakeBlob(name)
+
+    class FakeClient:
+        def bucket(self, _):
+            return FakeBucket()
+
+    (tmp_path / "index.html").write_text("dashboard", encoding="utf-8")
+    trace = tmp_path / "collected" / "node" / "rank-0" / "operator-trace.json"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("{}", encoding="utf-8")
+
+    upload_visualization(tmp_path, "traces", "atharva-instace_20260728_191530", client=FakeClient())
+
+    assert uploaded[0][0] == "atharva-instace_20260728_191530/index.html"
+    assert uploaded[1][0].endswith("collected/node/rank-0/operator-trace.json")

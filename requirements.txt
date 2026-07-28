@@ -3,6 +3,7 @@
 
 torch==2.13.0+cu126
 deepspeed==0.19.3
+google-cloud-storage
 ninja
 pytest
 ruff
