@@ -34,11 +34,23 @@ CATEGORY_COLORS = {
 OPERATION_COLORS = {
     "Model and DeepSpeed initialization": "#64748b",
     "Data loading": "#d6a21d",
-    "Forward": "#3b82f6",
-    "Backward": "#1d4ed8",
-    "Optimizer step": "#0f8a72",
-    "Save checkpoint": "#e36a2e",
+    "Forward": "#0072b2",
+    "Backward": "#d55e00",
+    "Optimizer step": "#009e73",
+    "Save checkpoint": "#cc79a7",
     "Full step": "#2563eb",
+}
+RESOURCE_PATTERNS = {
+    "CPU": "/",
+    "GPU": "",
+    "Storage": ".",
+    "Network": "|",
+}
+RESOURCE_OPACITY = {
+    "CPU": 0.72,
+    "GPU": 1.0,
+    "Storage": 0.88,
+    "Network": 0.88,
 }
 PLOT_CONFIG = {
     "responsive": True,
@@ -510,50 +522,76 @@ def resource_timeline(spans, host):
     figure = go.Figure()
     grouped = defaultdict(list)
     for span in spans:
-        grouped[span["operation"]].append(span)
-    for operation, rows in sorted(
-        grouped.items(), key=lambda item: min(row["start_s"] for row in item[1])
+        grouped[(span["operation"], span["resource"])].append(span)
+    for (operation, resource_name), rows in sorted(
+        grouped.items(),
+        key=lambda item: (
+            min(row["start_s"] for row in item[1]),
+            item[0][0],
+            item[0][1],
+        ),
     ):
+        color = OPERATION_COLORS.get(
+            operation, CATEGORY_COLORS.get(rows[0]["category"], "#64748b")
+        )
         figure.add_trace(
             go.Bar(
-                name=operation,
+                name=f"{operation} - {resource_name}",
+                legendgroup=operation,
                 orientation="h",
                 y=[
-                    f"{row['job']} / rank {row['rank']} / {row['resource']}"
+                    f"{row['job']} / rank {row['rank']} | {row['resource']}"
                     for row in rows
                 ],
                 x=[row["duration_s"] * 1000 for row in rows],
                 base=[row["start_utc"] for row in rows],
                 marker={
-                    "color": OPERATION_COLORS.get(
-                        operation, CATEGORY_COLORS.get(rows[0]["category"], "#64748b")
-                    ),
-                    "line": {"color": "white", "width": 0.7},
+                    "color": color,
+                    "opacity": RESOURCE_OPACITY.get(resource_name, 1.0),
+                    "line": {"color": "#ffffff", "width": 0.9},
+                    "pattern": {
+                        "shape": RESOURCE_PATTERNS.get(resource_name, ""),
+                        "solidity": 0.25,
+                    },
                 },
                 customdata=[
                     [
+                        operation,
+                        row["resource"],
                         row["category"],
                         row.get("step", "-"),
                         row["duration_s"] * 1000,
                         row.get("status", "ok"),
                         row.get("measurement", "wall_clock"),
                         row["start_utc"],
+                        row["worker"],
                     ]
                     for row in rows
                 ],
                 hovertemplate=(
-                    "operation=%{fullData.name}<br>category=%{customdata[0]}"
-                    "<br>step=%{customdata[1]}<br>start UTC=%{customdata[5]}"
-                    "<br>duration=%{customdata[2]:.3f}ms"
-                    "<br>status=%{customdata[3]}<br>measurement=%{customdata[4]}<extra></extra>"
+                    "phase=%{customdata[0]}<br>resource=%{customdata[1]}"
+                    "<br>category=%{customdata[2]}<br>worker=%{customdata[8]}"
+                    "<br>step=%{customdata[3]}<br>start UTC=%{customdata[7]}"
+                    "<br>duration=%{customdata[4]:.3f}ms"
+                    "<br>status=%{customdata[5]}"
+                    "<br>measurement=%{customdata[6]}<extra></extra>"
                 ),
             )
         )
     lanes = sorted(
-        {f"{span['job']} / rank {span['rank']} / {span['resource']}" for span in spans},
-        key=lambda lane: (int(re.search(r"rank (\d+)", lane).group(1)), lane),
+        {f"{span['job']} / rank {span['rank']} | {span['resource']}" for span in spans},
+        key=lambda lane: (
+            int(re.search(r"rank (\d+)", lane).group(1)),
+            {"CPU": 0, "GPU": 1, "Storage": 2, "Network": 3}.get(
+                lane.rsplit("|", 1)[-1].strip(), 4
+            ),
+            lane,
+        ),
     )
-    layout = _layout(f"{host} resource occupancy", max(480, 46 * len(lanes) + 180))
+    layout = _layout(
+        f"{host} forward/backward CPU and GPU phase timeline",
+        max(500, 48 * len(lanes) + 210),
+    )
     layout.update(
         {
             "barmode": "overlay",
@@ -565,7 +603,7 @@ def resource_timeline(spans, host):
                 "rangeslider": {"visible": True, "thickness": 0.07},
             },
             "yaxis": {
-                "title": "Rank resource",
+                "title": "Job / rank | resource",
                 "categoryorder": "array",
                 "categoryarray": lanes,
                 "autorange": "reversed",
@@ -1697,8 +1735,8 @@ def node_body(
         + "</div>"
         + f'<section id="{prefix}-resource-occupancy">'
         + _timeline_panel(
-            "Resource occupancy",
-            "Logical phases projected onto each rank's measured CPU, GPU, storage, and network resources.",
+            "Forward/backward CPU and GPU phase timeline",
+            "Each rank has separate CPU and GPU lanes; phase color identifies data loading, forward, backward, optimizer, synchronization, or checkpoint work.",
             resource_timeline(host_resource_spans, host),
             f"{prefix}-resource-timeline",
         )
@@ -1934,6 +1972,14 @@ def build_dashboard(data_dir, output_file):
             "cross-node-alignment",
         )
         + "</section>"
+        + '<section id="phase-occupancy">'
+        + _timeline_panel(
+            "Forward/backward CPU and GPU phases across all ranks",
+            "Paired CPU and GPU lanes expose phase overlap and imbalance on one absolute UTC axis.",
+            resource_timeline(resource_spans, "All nodes"),
+            "aggregate-phase-resource-timeline",
+        )
+        + "</section>"
         + '<section id="resource-activity"><h2>CPU, GPU, storage, and network activity</h2>'
         + _figure_html(
             resource_activity_figure(resource_spans), "aggregate-resource-activity"
@@ -2017,7 +2063,8 @@ def build_dashboard(data_dir, output_file):
     )
     nav = (
         '<nav><a href="#summary">Summary</a><a href="#metrics">Metrics</a>'
-        '<a href="#capacity">Capacity</a><a href="#operations">Operations</a>'
+        '<a href="#capacity">Capacity</a><a href="#phase-occupancy">CPU/GPU phases</a>'
+        '<a href="#operations">Operations</a>'
         '<a href="#communication">Communication</a>'
         '<a href="#checkpointing">Checkpointing</a><a href="#hardware">Hardware</a>'
         '<a href="#slow-spans">Slow spans</a><a href="#nodes">Per node</a></nav>'

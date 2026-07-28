@@ -17,6 +17,7 @@ from visualization.trace_tools import (
     build_spans,
     cross_node_alignment_figure,
     read_hosts,
+    resource_timeline,
     summarize_operator_trace,
     upload_visualization,
     visualization_files,
@@ -101,6 +102,28 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "duration_ms": 5,
         },
         {
+            "event": "span",
+            "host": "node",
+            "rank": 0,
+            "category": "Training",
+            "operation": "Backward",
+            "step": 1,
+            "start_ns": base_ns + 5_000_000,
+            "end_ns": base_ns + 12_000_000,
+            "duration_ms": 7,
+        },
+        {
+            "event": "span",
+            "host": "node",
+            "rank": 0,
+            "category": "Optimizer",
+            "operation": "Optimizer step",
+            "step": 1,
+            "start_ns": base_ns + 12_000_000,
+            "end_ns": base_ns + 15_000_000,
+            "duration_ms": 3,
+        },
+        {
             "event": "step",
             "step": 1,
             "loss": 2.5,
@@ -143,23 +166,29 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
         ),
         encoding="utf-8",
     )
+    phase_resources = (
+        ("Forward", "Training", 0, 5),
+        ("Backward", "Training", 5, 7),
+        ("Optimizer step", "Optimizer", 12, 3),
+    )
     resource_events = [
         {
             "event": "resource_span",
             "host": "node",
             "job": "tiny_gpt",
             "rank": 0,
-            "category": "Training",
-            "operation": "Forward",
+            "category": category,
+            "operation": operation,
             "resource": resource,
-            "start_ns": base_ns,
-            "end_ns": base_ns + 5_000_000,
-            "duration_ms": duration,
+            "start_ns": base_ns + offset_ms * 1_000_000,
+            "end_ns": base_ns + (offset_ms + duration_ms) * 1_000_000,
+            "duration_ms": duration_ms,
             "measurement": measurement,
         }
-        for resource, duration, measurement in (
-            ("CPU", 5, "profiler_cpu_total"),
-            ("GPU", 4, "profiler_device_total"),
+        for operation, category, offset_ms, duration_ms in phase_resources
+        for resource, measurement in (
+            ("CPU", "wall_clock"),
+            ("GPU", "cuda_event_elapsed"),
         )
     ]
     (worker_dir / "resource-trace.jsonl").write_text(
@@ -177,6 +206,13 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert "Cluster activity" in aggregate
     assert "Capacity and cross-node alignment" in aggregate
     assert "CPU, GPU, storage, and network activity" in aggregate
+    assert "Forward/backward CPU and GPU phases across all ranks" in aggregate
+    assert "Forward - CPU" in aggregate
+    assert "Forward - GPU" in aggregate
+    assert "Backward - CPU" in aggregate
+    assert "Backward - GPU" in aggregate
+    assert "Optimizer step - CPU" in aggregate
+    assert "Optimizer step - GPU" in aggregate
     assert "What happened?" in aggregate
     assert "Aggregate metrics" in aggregate
     assert "Collective communication occupancy" in aggregate
@@ -188,15 +224,15 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert '<script src="' not in aggregate
     assert node_page.is_file()
     node_html = node_page.read_text(encoding="utf-8")
-    assert "Resource occupancy" in node_html
+    assert "Forward/backward CPU and GPU phase timeline" in node_html
     assert "CPU and GPU operation timeline" in node_html
     assert "Collective communication occupancy" in node_html
     assert "Simulator hardware profile" in node_html
     assert "16.00 Gbps" in node_html
     assert "Absolute UTC time" in node_html
     assert r"Gradient\u002fNCCL sync" in node_html
-    assert r"tiny_gpt \u002f rank 0 \u002f CPU" in node_html
-    assert r"tiny_gpt \u002f rank 0 \u002f GPU" in node_html
+    assert r"tiny_gpt \u002f rank 0 | CPU" in node_html
+    assert r"tiny_gpt \u002f rank 0 | GPU" in node_html
     assert r"tiny_gpt \u002f rank 0 \u002f collective stream" in node_html
     assert "CPU/GPU log" in node_html
     assert simulator_profile["trace_start_utc"].startswith("2026-07-28T19:42:00")
@@ -247,6 +283,45 @@ def test_cross_node_timeline_preserves_utc_start_offsets():
     assert figure.data[0].customdata[0][1] == 0
     assert round(figure.data[0].customdata[1][1], 3) == 5
     assert figure.layout.xaxis.type == "date"
+
+
+def test_phase_timeline_separates_cpu_and_gpu_for_each_operation():
+    spans = []
+    for operation, start_s in (("Forward", 0.0), ("Backward", 0.01)):
+        for resource_name in ("CPU", "GPU"):
+            spans.append(
+                {
+                    "operation": operation,
+                    "resource": resource_name,
+                    "category": "Training",
+                    "job": "tiny_gpt",
+                    "rank": 0,
+                    "worker": "node/rank-0",
+                    "start_s": start_s,
+                    "duration_s": 0.005,
+                    "start_utc": f"2026-07-28T19:42:00.{int(start_s * 1000):03d}+00:00",
+                    "measurement": (
+                        "wall_clock" if resource_name == "CPU" else "cuda_event_elapsed"
+                    ),
+                }
+            )
+
+    figure = resource_timeline(spans, "node")
+    traces = {trace.name: trace for trace in figure.data}
+
+    assert set(traces) == {
+        "Forward - CPU",
+        "Forward - GPU",
+        "Backward - CPU",
+        "Backward - GPU",
+    }
+    assert traces["Forward - CPU"].marker.pattern.shape == "/"
+    assert traces["Forward - GPU"].marker.pattern.shape == ""
+    assert traces["Forward - CPU"].marker.opacity < traces["Forward - GPU"].marker.opacity
+    assert list(figure.layout.yaxis.categoryarray) == [
+        "tiny_gpt / rank 0 | CPU",
+        "tiny_gpt / rank 0 | GPU",
+    ]
 
 
 def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):

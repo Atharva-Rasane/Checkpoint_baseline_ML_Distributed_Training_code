@@ -182,8 +182,8 @@ make visualize
 
 `make visualize` selects the newest collected run and creates:
 
-- `visualization/index.html`: a self-contained operations report with aggregate findings, defined metrics, absolute UTC alignment, CPU/GPU/storage/network activity, collective occupancy, checkpointing, hardware profiles, searchable slow spans, and tabbed per-node drill-downs.
-- `visualization/nodes/<host>.html`: separate logical-resource, Kineto CPU/GPU, and NCCL collective timelines for one node, with explicit axis controls and links to the raw Perfetto and execution traces.
+- `visualization/index.html`: a self-contained operations report with aggregate findings, defined metrics, paired CPU/GPU forward-backward-optimizer lanes, absolute UTC alignment, collective occupancy, checkpointing, hardware profiles, searchable slow spans, and tabbed per-node drill-downs.
+- `visualization/nodes/<host>.html`: separate CPU and GPU lanes for every logical training phase, detailed Kineto operator/kernel lanes, and NCCL collective timelines for one node, with explicit axis controls and links to the raw Perfetto and execution traces.
 
 It already runs collection, so the shorter equivalent is:
 
