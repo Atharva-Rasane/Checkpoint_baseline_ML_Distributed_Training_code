@@ -12,7 +12,9 @@ from train import (
     directory_stats,
     finish_async_checkpoint,
     initialize_engine,
+    load_dataset,
     load_model,
+    resume_from_checkpoint,
 )
 from visualization.trace_tools import (
     build_dashboard,
@@ -42,6 +44,32 @@ def test_tiny_gpt_forward_returns_loss():
     assert output["logits"].shape == (2, 16, 128)
 
 
+def test_synthetic_dataset_is_deterministic_by_sample():
+    dataset = RandomTokenDataset(samples=4, seq_len=8, vocab_size=32, seed=7)
+
+    assert torch.equal(dataset[2]["input_ids"], dataset[2]["input_ids"])
+    assert not torch.equal(dataset[1]["input_ids"], dataset[2]["input_ids"])
+
+
+def test_model_module_can_provide_production_dataset(monkeypatch):
+    expected = RandomTokenDataset(samples=2, seq_len=4, vocab_size=8)
+    module = SimpleNamespace(
+        __name__="llm_models.production_model",
+        build_dataset=lambda **_kwargs: expected,
+    )
+    monkeypatch.setattr("train.load_model_module", lambda _name: module)
+
+    dataset = load_dataset(
+        "production_model",
+        samples=2,
+        seq_len=4,
+        vocab_size=8,
+        seed=1234,
+    )
+
+    assert dataset is expected
+
+
 def test_deepspeed_config_is_not_passed_twice():
     class FakeDeepSpeed:
         def initialize(self, **kwargs):
@@ -60,15 +88,42 @@ def test_deepspeed_config_is_not_passed_twice():
 
 
 def test_async_checkpoint_config_uses_decoupled_cpu_writer():
-    config = checkpoint_deepspeed_config("asynchronous")
+    config = checkpoint_deepspeed_config("asynchronous", batch_size=4)
 
     assert config["zero_optimization"]["stage"] == 3
+    assert config["train_micro_batch_size_per_gpu"] == 4
+    assert config["gradient_accumulation_steps"] == 1
     assert config["checkpoint"]["writer"] == {
         "type": "PYTHON",
         "decoupled": True,
         "data_parallel": "REPLICA",
         "show_statistics": True,
     }
+
+
+def test_synchronous_config_has_no_accumulation_or_async_writer():
+    config = checkpoint_deepspeed_config("synchronous", batch_size=3)
+
+    assert config["train_micro_batch_size_per_gpu"] == 3
+    assert config["gradient_accumulation_steps"] == 1
+    assert "checkpoint" not in config
+
+
+def test_resume_restores_completed_step_from_client_state():
+    class FakeEngine:
+        def load_checkpoint(self, output_dir, tag=None):
+            assert output_dir == "checkpoints"
+            assert tag is None
+            return "checkpoints/step-20/model.pt", {"completed_steps": 20}
+
+    completed_steps, path = resume_from_checkpoint(
+        FakeEngine(),
+        "checkpoints",
+        "latest",
+    )
+
+    assert completed_steps == 20
+    assert path == "checkpoints/step-20/model.pt"
 
 
 def test_async_checkpoint_completion_records_background_cpu_span(tmp_path, monkeypatch):

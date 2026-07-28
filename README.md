@@ -13,6 +13,15 @@ def build_model(**kwargs):
     return model
 ```
 
+For real training, the same model file should also define a dataset factory:
+
+```python
+def build_dataset(samples, seq_len, vocab_size, seed, **kwargs):
+    return training_dataset
+```
+
+It must return a `torch.utils.data.Dataset`. `tiny_gpt` intentionally falls back to deterministic random tokens and is only a smoke test for the distributed training system, not a production language-model workload.
+
 Setup:
 
 ```bash
@@ -166,7 +175,22 @@ Asynchronous checkpoints are written under `checkpoints/asynchronous/`. The chec
 
 GPU-to-host bars are emitted only for device-to-host memcpy events actually recorded by Kineto inside a checkpoint staging window. This repo offloads ZeRO-3 parameters and optimizer state to CPU, so a checkpoint may already start in host DRAM and show no GPU-to-host checkpoint copy. The asynchronous writer is a separate process outside the parent Kineto session: its CPU serialization and SSD bars therefore show the measured staging-complete-to-commit in-flight window, not invented active-operation boundaries. The storage detail includes the writer process's Linux `write_bytes` delta when `/proc/<pid>/io` is available. Only one checkpoint is kept in flight because DeepSpeed exposes one pending commit at a time.
 
-The configured `gradient_accumulation_steps` is `8`. The training loop calls `engine.step()` after every forward/backward microbatch, but DeepSpeed applies a real optimizer parameter update only at each eighth microbatch. On one GPU the effective batch per update is `2 microbatch samples x 8 accumulation steps = 16 samples`; with multiple data-parallel GPUs it is also multiplied by the GPU count. This is why the detailed trace shows the substantive optimizer update every eight iterations.
+`gradient_accumulation_steps` is fixed to `1`: every loop iteration performs forward, backward, and one real optimizer parameter update. DeepSpeed names its per-GPU setting `train_micro_batch_size_per_gpu`, but there is no accumulation in this project. Set it through `BATCH_SIZE`; the effective global batch for each update is `BATCH_SIZE x total GPU count`.
+
+For example, four GPUs with `BATCH_SIZE=8` perform one optimizer update from 32 samples per iteration:
+
+```bash
+make train MODEL=my_model GPUS=4 STEPS=10000 BATCH_SIZE=8 SAVE_EVERY=500
+```
+
+`STEPS` is the total target optimizer-update count. Training checkpoints preserve model, ZeRO-3 optimizer, learning-rate scheduler, and completed-step state. Resume from the checkpoint referenced by `latest`, or select an explicit tag:
+
+```bash
+make train-hostfile-local MODEL=my_model STEPS=10000 BATCH_SIZE=8 RESUME=latest
+make train-hostfile-local MODEL=my_model STEPS=10000 BATCH_SIZE=8 RESUME=step-5000
+```
+
+Use the corresponding `train-async-*` target and `ASYNC_OUTPUT_DIR` when resuming asynchronous checkpoints. Startup prints the per-GPU batch, global batch, step range, and accumulation value. The trainer also seeds model/data execution, rejects invalid sizes and non-finite losses, records the dataset type in traced hardware metadata, and fails immediately when a requested checkpoint cannot be restored.
 
 ## Full Distributed Traces
 

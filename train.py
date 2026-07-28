@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import platform
+import random
 import resource
 import socket
 import time
@@ -236,16 +237,24 @@ class TrainingTrace:
 
 
 class RandomTokenDataset(Dataset):
-    def __init__(self, samples, seq_len, vocab_size):
+    def __init__(self, samples, seq_len, vocab_size, seed=1234):
         self.samples = samples
         self.seq_len = seq_len
         self.vocab_size = vocab_size
+        self.seed = seed
 
     def __len__(self):
         return self.samples
 
-    def __getitem__(self, _):
-        tokens = torch.randint(0, self.vocab_size, (self.seq_len,), dtype=torch.long)
+    def __getitem__(self, index):
+        generator = torch.Generator().manual_seed(self.seed + int(index))
+        tokens = torch.randint(
+            0,
+            self.vocab_size,
+            (self.seq_len,),
+            dtype=torch.long,
+            generator=generator,
+        )
         return {"input_ids": tokens, "labels": tokens.clone()}
 
 
@@ -461,7 +470,7 @@ def hardware_profile(device, storage_dir, benchmark_mb, run_benchmarks):
     return values
 
 
-def load_model(model_name, **kwargs):
+def load_model_module(model_name):
     module_path = f"llm_models.{model_name}"
     try:
         module = importlib.import_module(module_path)
@@ -471,9 +480,35 @@ def load_model(model_name, **kwargs):
             raise SystemExit(f"Unknown model '{model_name}'. Available models: {available}") from exc
         raise
 
+    return module
+
+
+def load_model(model_name, **kwargs):
+    module = load_model_module(model_name)
+    module_path = module.__name__
     if not hasattr(module, "build_model"):
         raise SystemExit(f"{module_path} must define build_model(**kwargs)")
     return module.build_model(**kwargs)
+
+
+def load_dataset(model_name, **kwargs):
+    module = load_model_module(model_name)
+    if hasattr(module, "build_dataset"):
+        dataset = module.build_dataset(**kwargs)
+    else:
+        dataset = RandomTokenDataset(**kwargs)
+    if not isinstance(dataset, Dataset):
+        raise TypeError(
+            f"{module.__name__}.build_dataset(**kwargs) must return a torch Dataset"
+        )
+    return dataset
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def parse_args():
@@ -484,6 +519,12 @@ def parse_args():
     parser.add_argument("--job_name", help="Trace label for this distributed training job")
     parser.add_argument("--output_dir", default="checkpoints")
     parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--resume",
+        help="Resume from 'latest' or a checkpoint tag such as step-100",
+    )
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--vocab_size", type=int, default=50304)
@@ -498,13 +539,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def checkpoint_deepspeed_config(checkpoint_mode):
-    if checkpoint_mode == "synchronous":
-        return None
-    if checkpoint_mode != "asynchronous":
+def checkpoint_deepspeed_config(checkpoint_mode, batch_size=None):
+    if checkpoint_mode not in {"synchronous", "asynchronous"}:
         raise ValueError(f"Unsupported checkpoint mode: {checkpoint_mode}")
     config_path = Path(__file__).with_name("ds_config_zero3.json")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if batch_size is not None:
+        config["train_micro_batch_size_per_gpu"] = batch_size
+    config["gradient_accumulation_steps"] = 1
+    if checkpoint_mode == "synchronous":
+        return config
     config["checkpoint"] = {
         "tag_validation": "WARN",
         "checkpoint_serialization": True,
@@ -516,6 +560,37 @@ def checkpoint_deepspeed_config(checkpoint_mode):
         },
     }
     return config
+
+
+def resume_from_checkpoint(engine, output_dir, resume):
+    requested_tag = None if resume == "latest" else resume
+    load_path, client_state = engine.load_checkpoint(output_dir, tag=requested_tag)
+    if load_path is None:
+        raise FileNotFoundError(
+            f"Unable to load checkpoint {resume!r} from {output_dir}"
+        )
+    client_state = client_state or {}
+    completed_steps = client_state.get("completed_steps")
+    if completed_steps is None:
+        candidates = [resume, *Path(load_path).parts]
+        step_tag = next(
+            (
+                value
+                for value in reversed(candidates)
+                if isinstance(value, str) and value.startswith("step-")
+            ),
+            None,
+        )
+        if step_tag is not None and step_tag.removeprefix("step-").isdigit():
+            completed_steps = int(step_tag.removeprefix("step-"))
+    if completed_steps is None:
+        raise ValueError(
+            "Checkpoint has no completed_steps client state or step-N tag"
+        )
+    completed_steps = int(completed_steps)
+    if completed_steps < 0:
+        raise ValueError("Checkpoint completed_steps cannot be negative")
+    return completed_steps, load_path
 
 
 def initialize_engine(deepspeed, args, model, dataset, config=None):
@@ -635,7 +710,11 @@ def start_async_checkpoint(engine, trace, step, output_dir):
         resource_measurement="checkpoint_state_snapshot_wall_clock",
         emit_gpu_resource=False,
     ):
-        engine.save_checkpoint(output_dir, tag=tag)
+        engine.save_checkpoint(
+            output_dir,
+            tag=tag,
+            client_state={"completed_steps": step},
+        )
     staged_ns = time.time_ns()
     process = getattr(engine.checkpoint_engine, "ckpt_process", None)
     worker_pid = getattr(process, "pid", None)
@@ -664,14 +743,20 @@ def main(checkpoint_mode="synchronous"):
     import deepspeed
 
     args = parse_args()
-    deepspeed_config = checkpoint_deepspeed_config(checkpoint_mode)
-    if deepspeed_config is not None:
-        args.deepspeed_config = None
+    if args.steps < 1 or args.batch_size < 1 or args.save_every < 1:
+        raise ValueError("steps, batch_size, and save_every must all be positive")
+    deepspeed_config = checkpoint_deepspeed_config(
+        checkpoint_mode,
+        batch_size=args.batch_size,
+    )
+    args.deepspeed_config = None
     deepspeed.init_distributed()
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     torch.cuda.set_device(args.local_rank)
+    seed_everything(args.seed)
+    global_batch_size = args.batch_size * world_size
 
     trace = TrainingTrace(
         args.trace,
@@ -683,6 +768,11 @@ def main(checkpoint_mode="synchronous"):
             "job": args.job_name or args.model_name,
             "model": args.model_name,
             "steps": args.steps,
+            "batch_size_per_gpu": args.batch_size,
+            "global_batch_size": global_batch_size,
+            "gradient_accumulation_steps": 1,
+            "seed": args.seed,
+            "resume": args.resume,
             "save_every": args.save_every,
             "checkpoint_mode": checkpoint_mode,
             "torch_version": torch.__version__,
@@ -691,6 +781,8 @@ def main(checkpoint_mode="synchronous"):
     )
 
     error = None
+    start_step = 1
+    resume_path = None
     try:
         with trace.span("Setup", "Model and DeepSpeed initialization"):
             model = load_model(args.model_name, vocab_size=args.vocab_size, seq_len=args.seq_len)
@@ -701,7 +793,13 @@ def main(checkpoint_mode="synchronous"):
             parameter_bytes = sum(
                 parameter.numel() * parameter.element_size() for parameter in model.parameters()
             )
-            dataset = RandomTokenDataset(args.dataset_samples, args.seq_len, args.vocab_size)
+            dataset = load_dataset(
+                args.model_name,
+                samples=args.dataset_samples,
+                seq_len=args.seq_len,
+                vocab_size=args.vocab_size,
+                seed=args.seed,
+            )
             engine, _, _, _ = initialize_engine(
                 deepspeed,
                 args,
@@ -711,6 +809,27 @@ def main(checkpoint_mode="synchronous"):
             )
             if checkpoint_mode == "asynchronous" and not engine.checkpoint_engine.is_decoupled():
                 raise RuntimeError("DeepSpeed did not initialize its decoupled checkpoint engine")
+            seed_everything(args.seed + rank)
+
+            if args.resume:
+                with trace.span(
+                    "Setup",
+                    "Load checkpoint",
+                    requested_checkpoint=args.resume,
+                ):
+                    completed_steps, resume_path = resume_from_checkpoint(
+                        engine,
+                        args.output_dir,
+                        args.resume,
+                    )
+                start_step = completed_steps + 1
+                trace.log(
+                    "checkpoint_loaded",
+                    requested_checkpoint=args.resume,
+                    checkpoint_path=resume_path,
+                    completed_steps=completed_steps,
+                    next_step=start_step,
+                )
 
             if args.trace:
                 torch.distributed.barrier()
@@ -736,6 +855,11 @@ def main(checkpoint_mode="synchronous"):
                     sequence_length=args.seq_len,
                     vocabulary_size=args.vocab_size,
                     dataset_samples=args.dataset_samples,
+                    dataset_type=type(dataset).__name__,
+                    synthetic_dataset=isinstance(dataset, RandomTokenDataset),
+                    batch_size_per_gpu=args.batch_size,
+                    global_batch_size=global_batch_size,
+                    gradient_accumulation_steps=1,
                     **profile,
                 )
                 torch.distributed.barrier()
@@ -744,7 +868,14 @@ def main(checkpoint_mode="synchronous"):
         data_iter = iter(engine.training_dataloader)
         pending_checkpoint = None
 
-        for step in range(1, args.steps + 1):
+        if rank == 0:
+            print(
+                f"training model={args.model_name} steps={start_step}-{args.steps} "
+                f"batch_per_gpu={args.batch_size} global_batch={global_batch_size} "
+                "gradient_accumulation=1"
+            )
+
+        for step in range(start_step, args.steps + 1):
             if args.trace:
                 torch.cuda.synchronize(engine.device)
             step_started = time.perf_counter()
@@ -760,6 +891,8 @@ def main(checkpoint_mode="synchronous"):
 
             with trace.span("Training", "Forward", step=step):
                 loss = engine(**batch)["loss"]
+                if not bool(torch.isfinite(loss.detach()).all()):
+                    raise FloatingPointError(f"Non-finite loss at step {step}")
             with trace.span("Training", "Backward", step=step):
                 engine.backward(loss)
             with trace.span("Optimizer", "Optimizer step", step=step):
@@ -783,6 +916,9 @@ def main(checkpoint_mode="synchronous"):
                     start_ns=step_started_ns,
                     end_ns=time.time_ns(),
                     duration_ms=(time.perf_counter() - step_started) * 1000,
+                    batch_size_per_gpu=args.batch_size,
+                    global_batch_size=global_batch_size,
+                    optimizer_update=True,
                     cuda_allocated_bytes=torch.cuda.memory_allocated(engine.device),
                     cuda_reserved_bytes=torch.cuda.memory_reserved(engine.device),
                     cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(engine.device),
@@ -828,7 +964,11 @@ def main(checkpoint_mode="synchronous"):
                         resource_measurement="synchronous_checkpoint_wall_clock",
                         emit_gpu_resource=False,
                     ):
-                        engine.save_checkpoint(args.output_dir, tag=tag)
+                        engine.save_checkpoint(
+                            args.output_dir,
+                            tag=tag,
+                            client_state={"completed_steps": step},
+                        )
                     checkpoint_completed_ns = time.time_ns()
                     checkpoint_duration_ms = (
                         time.perf_counter() - checkpoint_started
