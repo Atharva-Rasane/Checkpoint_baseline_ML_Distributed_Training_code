@@ -196,10 +196,12 @@ Use the corresponding `train-async-*` target and `ASYNC_OUTPUT_DIR` when resumin
 
 Tracing is opt-in because collecting every CPU operation, CUDA kernel, tensor shape, stack, FLOP estimate, and memory event adds significant overhead and can produce large files.
 
+By default, training completes three untraced warm-up iterations and starts detailed collection on iteration four. Set `TRACE_WARMUP=0` to trace from the first iteration or choose another warm-up count. Warm-up iterations still perform normal optimizer updates and checkpoints.
+
 Run a traced job and include at least one checkpoint:
 
 ```bash
-make train-hostfile-local MODEL=tiny_gpt STEPS=10 SAVE_EVERY=5 TRACE=1
+make train-hostfile-local MODEL=tiny_gpt STEPS=10 SAVE_EVERY=1 TRACE=1 TRACE_WARMUP=3
 ```
 
 `JOB` labels the CPU/GPU lanes and defaults to `MODEL`. Set it when multiple jobs use the same model, for example `JOB=pretrain-a`.

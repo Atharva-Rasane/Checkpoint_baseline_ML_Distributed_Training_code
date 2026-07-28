@@ -28,6 +28,8 @@ class TrainingTrace:
         self.cuda_span_events = {}
         self.next_span_id = 0
         self.cuda_timing = enabled and torch.cuda.is_available()
+        self.active = False
+        self.metadata = metadata
         if not enabled:
             return
 
@@ -35,6 +37,11 @@ class TrainingTrace:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.events_file = (self.output_dir / "metrics.jsonl").open("a", encoding="utf-8", buffering=1)
 
+        self.log("run_start", rank=rank, world_size=world_size, **metadata)
+
+    def start_profiler(self, completed_warmup_steps=0):
+        if not self.enabled or self.active:
+            return
         observer = torch.profiler.ExecutionTraceObserver().register_callback(
             str(self.output_dir / "execution-trace.json")
         )
@@ -50,17 +57,22 @@ class TrainingTrace:
             execution_trace_observer=observer,
         )
         self.profiler.start()
-        self.profiler.add_metadata_json("run", json.dumps(metadata))
-        self.log("run_start", rank=rank, world_size=world_size, **metadata)
+        self.profiler.add_metadata_json("run", json.dumps(self.metadata))
+        self.active = True
+        self.log(
+            "trace_start",
+            completed_warmup_steps=completed_warmup_steps,
+            **self.metadata,
+        )
 
     def region(self, name):
-        if not self.enabled:
+        if not self.active:
             return nullcontext()
         return torch.profiler.record_function(name)
 
     @contextmanager
     def span(self, category, operation, **values):
-        if not self.enabled:
+        if not self.active:
             yield
             return
 
@@ -97,7 +109,7 @@ class TrainingTrace:
             )
 
     def record_span(self, category, operation, start_ns, end_ns, span_id=None, **values):
-        if not self.enabled:
+        if not self.active:
             return
         if span_id is None:
             span_id = self.next_span_id
@@ -137,11 +149,14 @@ class TrainingTrace:
             return
         self.log("run_end" if error is None else "run_error", error=error)
         try:
-            self.profiler.stop()
-            self.profiler.export_chrome_trace(str(self.output_dir / "operator-trace.json"))
-            if self.cuda_timing:
-                torch.cuda.synchronize()
-            self._export_resource_trace()
+            if self.profiler is not None:
+                self.profiler.stop()
+                self.profiler.export_chrome_trace(
+                    str(self.output_dir / "operator-trace.json")
+                )
+                if self.cuda_timing:
+                    torch.cuda.synchronize()
+                self._export_resource_trace()
         finally:
             self.events_file.close()
 
@@ -531,6 +546,7 @@ def parse_args():
     parser.add_argument("--dataset_samples", type=int, default=10000)
     parser.add_argument("--hardware_benchmark_mb", type=int, default=64)
     parser.add_argument("--trace", action="store_true", help="Collect full per-rank CPU/CUDA traces")
+    parser.add_argument("--trace_warmup_steps", type=int, default=3)
     parser.add_argument("--trace_dir", default="visualization/traces")
     parser.add_argument("--run_id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", "-1")))
@@ -745,6 +761,8 @@ def main(checkpoint_mode="synchronous"):
     args = parse_args()
     if args.steps < 1 or args.batch_size < 1 or args.save_every < 1:
         raise ValueError("steps, batch_size, and save_every must all be positive")
+    if args.trace_warmup_steps < 0:
+        raise ValueError("trace_warmup_steps cannot be negative")
     deepspeed_config = checkpoint_deepspeed_config(
         checkpoint_mode,
         batch_size=args.batch_size,
@@ -771,6 +789,7 @@ def main(checkpoint_mode="synchronous"):
             "batch_size_per_gpu": args.batch_size,
             "global_batch_size": global_batch_size,
             "gradient_accumulation_steps": 1,
+            "trace_warmup_steps": args.trace_warmup_steps,
             "seed": args.seed,
             "resume": args.resume,
             "save_every": args.save_every,
@@ -783,6 +802,7 @@ def main(checkpoint_mode="synchronous"):
     error = None
     start_step = 1
     resume_path = None
+    hardware_trace = None
     try:
         with trace.span("Setup", "Model and DeepSpeed initialization"):
             model = load_model(args.model_name, vocab_size=args.vocab_size, seq_len=args.seq_len)
@@ -845,23 +865,22 @@ def main(checkpoint_mode="synchronous"):
                         args.hardware_benchmark_mb,
                     )
                 )
-                trace.log(
-                    "hardware_profile",
-                    local_rank=args.local_rank,
-                    model_parameter_count=parameter_count,
-                    model_trainable_parameter_count=trainable_parameter_count,
-                    model_parameter_bytes=parameter_bytes,
-                    gradient_bytes_estimate=parameter_bytes,
-                    sequence_length=args.seq_len,
-                    vocabulary_size=args.vocab_size,
-                    dataset_samples=args.dataset_samples,
-                    dataset_type=type(dataset).__name__,
-                    synthetic_dataset=isinstance(dataset, RandomTokenDataset),
-                    batch_size_per_gpu=args.batch_size,
-                    global_batch_size=global_batch_size,
-                    gradient_accumulation_steps=1,
+                hardware_trace = {
+                    "local_rank": args.local_rank,
+                    "model_parameter_count": parameter_count,
+                    "model_trainable_parameter_count": trainable_parameter_count,
+                    "model_parameter_bytes": parameter_bytes,
+                    "gradient_bytes_estimate": parameter_bytes,
+                    "sequence_length": args.seq_len,
+                    "vocabulary_size": args.vocab_size,
+                    "dataset_samples": args.dataset_samples,
+                    "dataset_type": type(dataset).__name__,
+                    "synthetic_dataset": isinstance(dataset, RandomTokenDataset),
+                    "batch_size_per_gpu": args.batch_size,
+                    "global_batch_size": global_batch_size,
+                    "gradient_accumulation_steps": 1,
                     **profile,
-                )
+                }
                 torch.distributed.barrier()
 
         engine.train()
@@ -876,7 +895,16 @@ def main(checkpoint_mode="synchronous"):
             )
 
         for step in range(start_step, args.steps + 1):
-            if args.trace:
+            completed_warmup_steps = step - start_step
+            if (
+                args.trace
+                and not trace.active
+                and completed_warmup_steps >= args.trace_warmup_steps
+            ):
+                torch.distributed.barrier()
+                trace.start_profiler(completed_warmup_steps)
+                trace.log("hardware_profile", **hardware_trace)
+            if trace.active:
                 torch.cuda.synchronize(engine.device)
             step_started = time.perf_counter()
             step_started_ns = time.time_ns()
@@ -906,7 +934,7 @@ def main(checkpoint_mode="synchronous"):
                     rank,
                 )
 
-            if args.trace:
+            if trace.active:
                 torch.cuda.synchronize(engine.device)
                 trace.log(
                     "step",

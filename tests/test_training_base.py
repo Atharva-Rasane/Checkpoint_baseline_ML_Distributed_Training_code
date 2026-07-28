@@ -654,6 +654,9 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
         world_size=1,
         metadata={"model": "tiny_gpt"},
     )
+    with trace.span("Training", "Warmup", step=1):
+        torch.ones(2) + 1
+    trace.start_profiler(completed_warmup_steps=3)
     with trace.span("Training", "Forward", step=1):
         torch.ones(2) + 1
     trace.log("step", step=1, loss=1.0)
@@ -665,6 +668,7 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
     resource_events = (worker_dir / "resource-trace.jsonl").read_text(encoding="utf-8")
     assert '"resource": "CPU"' in resource_events
     assert '"operation": "Forward"' in resource_events
+    assert '"operation": "Warmup"' not in resource_events
     assert '"schema_version": 2' in resource_events
     assert '"start_alignment": "observed_wall_clock"' in resource_events
     assert '"profiler_cpu_total_ms":' in resource_events
@@ -674,6 +678,9 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
     assert '"event": "step"' in (worker_dir / "metrics.jsonl").read_text(
         encoding="utf-8"
     )
+    assert '"completed_warmup_steps": 3' in (
+        worker_dir / "metrics.jsonl"
+    ).read_text(encoding="utf-8")
 
 
 def test_resource_trace_records_gpu_timing_provenance(tmp_path):
