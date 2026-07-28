@@ -48,7 +48,7 @@ On the VM:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git gh make python3 python3-venv python3-pip build-essential libaio-dev
+sudo apt-get install -y git gh make python3 python3-venv python3-pip build-essential libaio-dev pdsh
 lspci | grep -i nvidia
 nvidia-smi
 ```
@@ -155,6 +155,16 @@ Then launch from the first VM:
 ```bash
 make train-multinode HOSTFILE=hostfile MASTER_ADDR=10.128.0.12 MODEL=tiny_gpt STEPS=100
 ```
+
+Only the first VM runs the `make train-multinode` command. DeepSpeed uses `pdsh` and node-to-node SSH to start one process for every hostfile slot. Verify fan-out from that VM before training:
+
+```bash
+PDSH_RCMD_TYPE=ssh pdsh -w 10.128.0.12,10.128.0.13 hostname
+```
+
+For GCP, assign one cluster network tag to every training VM and allow TCP, UDP, and ICMP only from that same source tag to the same target tag. This permits SSH, NCCL, and dynamic distributed ports without exposing them publicly. With OS Login enabled, register the coordinator's cluster public key with OS Login so ordinary internal-IP SSH works from rank 0.
+
+The multi-node Make targets generate an ignored `.deepspeed_env` file containing the virtualenv `PATH` and `CUDA_HOME`. DeepSpeed exports it to remote ranks so `.venv/bin/ninja` is discoverable while JIT-loading CPUAdam. If remote ranks report `Ninja is required to load C++ extensions` even though `.venv/bin/ninja --version` works, pull the latest repo version and rerun the Make target; do not reinstall PyTorch. The synchronous and asynchronous wrappers also force the project root to the front of `sys.path`, fixing the multi-node-only `module 'train' has no attribute 'main'` import failure.
 
 Checkpoints are saved under `checkpoints/`.
 

@@ -1,4 +1,4 @@
-.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode train-async train-async-hostfile-local train-async-multinode collect visualize serve upload test lint check clean
+.PHONY: setup install cuda-check doctor hostfile-local deepspeed-env train train-hostfile-local train-multinode train-async train-async-hostfile-local train-async-multinode collect visualize serve upload test lint check clean
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
@@ -58,13 +58,16 @@ hostfile-local:
 	printf "localhost slots=%s\n" "$$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" > $(HOSTFILE)
 	cat $(HOSTFILE)
 
+deepspeed-env: cuda-check
+	printf 'PATH=%s:%s/bin:$$PATH\nCUDA_HOME=%s\n' "$(abspath $(VENV))/bin" "$(CUDA_HOME)" "$(CUDA_HOME)" > .deepspeed_env
+
 train: cuda-check
 	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) $(SYNC_TRAIN) $(TRAIN_ARGS)
 
 train-hostfile-local: cuda-check hostfile-local
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) $(SYNC_TRAIN) $(TRAIN_ARGS)
 
-train-multinode: cuda-check
+train-multinode: deepspeed-env
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) $(SYNC_TRAIN) $(TRAIN_ARGS)
 
 train-async: cuda-check
@@ -73,7 +76,7 @@ train-async: cuda-check
 train-async-hostfile-local: cuda-check hostfile-local
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) $(ASYNC_TRAIN) $(ASYNC_TRAIN_ARGS)
 
-train-async-multinode: cuda-check
+train-async-multinode: deepspeed-env
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) $(ASYNC_TRAIN) $(ASYNC_TRAIN_ARGS)
 
 collect:

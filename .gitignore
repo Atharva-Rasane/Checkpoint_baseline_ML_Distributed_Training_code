@@ -11,4 +11,5 @@ visualization/index.html
 visualization/plotly.min.js
 visualization/simulator-profile.json
 hostfile
+.deepspeed_env
 *.log
