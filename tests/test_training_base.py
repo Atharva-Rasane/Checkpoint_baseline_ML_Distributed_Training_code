@@ -437,6 +437,20 @@ def test_phase_timeline_separates_cpu_and_gpu_for_each_operation():
                     ),
                 }
             )
+    spans.append(
+        {
+            "operation": "Async checkpoint persistence",
+            "resource": "CPU",
+            "category": "Checkpoint",
+            "job": "tiny_gpt",
+            "rank": 0,
+            "worker": "node/rank-0",
+            "start_s": 0.002,
+            "duration_s": 0.012,
+            "start_utc": "2026-07-28T19:42:00.002+00:00",
+            "measurement": "background_checkpoint_process_wall_clock",
+        }
+    )
 
     figure = resource_timeline(spans, "node")
     traces = {trace.name: trace for trace in figure.data}
@@ -446,14 +460,23 @@ def test_phase_timeline_separates_cpu_and_gpu_for_each_operation():
         "Forward - GPU",
         "Backward - CPU",
         "Backward - GPU",
+        "Async checkpoint persistence - CPU",
     }
     assert traces["Forward - CPU"].marker.pattern.shape == "/"
     assert traces["Forward - GPU"].marker.pattern.shape == ""
     assert traces["Forward - CPU"].marker.opacity < traces["Forward - GPU"].marker.opacity
-    assert list(figure.layout.yaxis.categoryarray) == [
-        "tiny_gpt / rank 0 | CPU",
+    assert traces["Forward - CPU"].width[0] == 0.36
+    assert traces["Async checkpoint persistence - CPU"].width[0] == 0.36
+    assert traces["Forward - GPU"].width[0] == 0.68
+    assert traces["Forward - CPU"].y[0] != traces["Async checkpoint persistence - CPU"].y[0]
+    assert list(figure.layout.yaxis.ticktext) == [
+        "tiny_gpt / rank 0 | CPU [checkpoint | training]",
         "tiny_gpt / rank 0 | GPU",
     ]
+    assert traces["Forward - CPU"].customdata[0][13] == "training half"
+    assert traces["Async checkpoint persistence - CPU"].customdata[0][13] == (
+        "checkpoint half"
+    )
 
 
 def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):

@@ -550,6 +550,36 @@ def _resource_measurement_summary(row):
 
 def resource_timeline(spans, host):
     figure = go.Figure()
+
+    def lane_name(span):
+        return f"{span['job']} / rank {span['rank']} | {span['resource']}"
+
+    lanes = sorted(
+        {lane_name(span) for span in spans},
+        key=lambda lane: (
+            int(re.search(r"rank (\d+)", lane).group(1)),
+            {"CPU": 0, "GPU": 1, "Storage": 2, "Network": 3}.get(
+                lane.rsplit("|", 1)[-1].strip(), 4
+            ),
+            lane,
+        ),
+    )
+    lane_positions = {lane: index for index, lane in enumerate(lanes)}
+    split_cpu_lanes = {
+        lane_name(span)
+        for span in spans
+        if span["resource"] == "CPU" and span["category"] == "Checkpoint"
+    }
+
+    def lane_geometry(row):
+        lane = lane_name(row)
+        center = lane_positions[lane]
+        if lane not in split_cpu_lanes:
+            return center, 0.68, "full resource lane"
+        if row["category"] == "Checkpoint":
+            return center - 0.2, 0.36, "checkpoint half"
+        return center + 0.2, 0.36, "training half"
+
     grouped = defaultdict(list)
     for span in spans:
         grouped[(span["operation"], span["resource"])].append(span)
@@ -569,10 +599,8 @@ def resource_timeline(spans, host):
                 name=f"{operation} - {resource_name}",
                 legendgroup=operation,
                 orientation="h",
-                y=[
-                    f"{row['job']} / rank {row['rank']} | {row['resource']}"
-                    for row in rows
-                ],
+                y=[lane_geometry(row)[0] for row in rows],
+                width=[lane_geometry(row)[1] for row in rows],
                 x=[row["duration_s"] * 1000 for row in rows],
                 base=[row["start_utc"] for row in rows],
                 marker={
@@ -599,6 +627,7 @@ def resource_timeline(spans, host):
                         "yes" if row.get("start_is_estimated") else "no",
                         _resource_measurement_summary(row),
                         row.get("checkpoint_worker_pid", "-"),
+                        lane_geometry(row)[2],
                     ]
                     for row in rows
                 ],
@@ -612,20 +641,11 @@ def resource_timeline(spans, host):
                     "<br>start alignment=%{customdata[9]}"
                     "<br>estimated start=%{customdata[10]}"
                     "<br>timing detail=%{customdata[11]}"
-                    "<br>checkpoint process PID=%{customdata[12]}<extra></extra>"
+                    "<br>checkpoint process PID=%{customdata[12]}"
+                    "<br>CPU lane strip=%{customdata[13]}<extra></extra>"
                 ),
             )
         )
-    lanes = sorted(
-        {f"{span['job']} / rank {span['rank']} | {span['resource']}" for span in spans},
-        key=lambda lane: (
-            int(re.search(r"rank (\d+)", lane).group(1)),
-            {"CPU": 0, "GPU": 1, "Storage": 2, "Network": 3}.get(
-                lane.rsplit("|", 1)[-1].strip(), 4
-            ),
-            lane,
-        ),
-    )
     layout = _layout(
         f"{host} forward/backward CPU and GPU phase timeline",
         max(500, 48 * len(lanes) + 210),
@@ -642,11 +662,31 @@ def resource_timeline(spans, host):
             },
             "yaxis": {
                 "title": "Job / rank | resource",
-                "categoryorder": "array",
-                "categoryarray": lanes,
+                "tickmode": "array",
+                "tickvals": list(range(len(lanes))),
+                "ticktext": [
+                    f"{lane} [checkpoint | training]"
+                    if lane in split_cpu_lanes
+                    else lane
+                    for lane in lanes
+                ],
                 "autorange": "reversed",
                 "automargin": True,
             },
+            "shapes": [
+                {
+                    "type": "line",
+                    "xref": "paper",
+                    "x0": 0,
+                    "x1": 1,
+                    "yref": "y",
+                    "y0": lane_positions[lane],
+                    "y1": lane_positions[lane],
+                    "line": {"color": "#cbd5e1", "width": 1},
+                    "layer": "below",
+                }
+                for lane in split_cpu_lanes
+            ],
         }
     )
     figure.update_layout(**layout)

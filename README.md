@@ -162,7 +162,7 @@ make train-async-hostfile-local MODEL=tiny_gpt STEPS=16 SAVE_EVERY=2 TRACE=1
 make upload
 ```
 
-Asynchronous checkpoints are written under `checkpoints/asynchronous/`. The trace shows `Async checkpoint staging`, `Async checkpoint persistence`, and any `Async checkpoint commit wait` on the CPU lane. Only one checkpoint is kept in flight because DeepSpeed exposes one pending commit at a time.
+Asynchronous checkpoints are written under `checkpoints/asynchronous/`. The trace shows `Async checkpoint staging`, `Async checkpoint persistence`, and any `Async checkpoint commit wait` on the CPU lane. When checkpointing overlaps training, that CPU row is split into checkpoint and training half-height strips instead of blending the bars. Only one checkpoint is kept in flight because DeepSpeed exposes one pending commit at a time.
 
 The configured `gradient_accumulation_steps` is `8`. The training loop calls `engine.step()` after every forward/backward microbatch, but DeepSpeed applies a real optimizer parameter update only at each eighth microbatch. On one GPU the effective batch per update is `2 microbatch samples x 8 accumulation steps = 16 samples`; with multiple data-parallel GPUs it is also multiplied by the GPU count. This is why the detailed trace shows the substantive optimizer update every eight iterations.
 
