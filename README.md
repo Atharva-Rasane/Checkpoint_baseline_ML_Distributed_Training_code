@@ -233,9 +233,21 @@ Each rank writes wall-clock-aligned job spans, separate wall-clock CPU and CUDA-
 Collect traces from every host in `hostfile` and build the dashboard:
 
 ```bash
-make collect
-make visualize
+make collect COLLECT_RUN_ID=20260728T223339Z
+make visualize COLLECT_RUN_ID=20260728T223339Z
 ```
+
+Set `COLLECT_RUN_ID` to the run identifier printed by training. This limits collection,
+dashboard parsing, and upload to that run; omitting it includes historical traces from
+every host and can consume many gigabytes. If traces have already been collected and the
+worker VMs are stopped, build and upload directly from the coordinator's persistent disk:
+
+```bash
+make upload-existing COLLECT_RUN_ID=20260728T223339Z
+```
+
+For a live cluster, `make upload COLLECT_RUN_ID=<run-id>` performs collection, dashboard
+generation, and upload in one command.
 
 `make visualize` selects the newest collected run and creates:
 

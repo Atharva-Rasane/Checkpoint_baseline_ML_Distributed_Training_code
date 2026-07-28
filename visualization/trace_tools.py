@@ -108,29 +108,33 @@ def is_local_host(host):
     return host in {"localhost", "127.0.0.1", socket.gethostname(), socket.getfqdn()}
 
 
-def collect_host(host, source, output, remote_dir):
+def collect_host(host, source, output, remote_dir, run_id=None):
     destination = output / safe_name(host)
+    trace_source = source
+    if run_id:
+        trace_source = source / run_id
+        destination = destination / run_id
     destination.mkdir(parents=True, exist_ok=True)
     if is_local_host(host):
-        if not source.exists():
-            raise FileNotFoundError(f"No local traces found at {source}")
-        shutil.copytree(source, destination, dirs_exist_ok=True)
+        if not trace_source.exists():
+            raise FileNotFoundError(f"No local traces found at {trace_source}")
+        shutil.copytree(trace_source, destination, dirs_exist_ok=True)
         return
 
     remote_source = (
-        f"{host}:{remote_dir.rstrip('/')}/{source.as_posix().lstrip('./')}/."
+        f"{host}:{remote_dir.rstrip('/')}/{trace_source.as_posix().lstrip('./')}/."
     )
     subprocess.run(["scp", "-r", remote_source, str(destination)], check=True)
 
 
-def collect(hostfile, source, output, remote_dir):
+def collect(hostfile, source, output, remote_dir, run_id=None):
     hosts = read_hosts(hostfile)
     if not hosts:
         raise ValueError(f"No hosts found in {hostfile}")
     output.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=len(hosts)) as pool:
         futures = [
-            pool.submit(collect_host, host, source, output, remote_dir)
+            pool.submit(collect_host, host, source, output, remote_dir, run_id)
             for host in hosts
         ]
         for future in futures:
@@ -294,16 +298,19 @@ def summarize_operator_trace(path):
     return summary
 
 
-def load_workers(data_dir):
+def load_workers(data_dir, run_id=None):
     workers = []
     for metrics_file in sorted(data_dir.rglob("metrics.jsonl")):
+        discovered_run_id = metrics_file.parent.parent.parent.name
+        if run_id and discovered_run_id != run_id:
+            continue
         events = _read_jsonl(metrics_file)
         start = next(
             (event for event in events if event.get("event") == "run_start"), {}
         )
         worker_dir = metrics_file.parent
         host = str(start.get("host") or worker_dir.parent.name)
-        run_id = worker_dir.parent.parent.name
+        worker_run_id = worker_dir.parent.parent.name
         operator_trace = worker_dir / "operator-trace.json"
         workers.append(
             {
@@ -314,7 +321,7 @@ def load_workers(data_dir):
                 "checkpoint_mode": start.get("checkpoint_mode", "synchronous"),
                 "rank": int(start.get("rank", worker_dir.name.removeprefix("rank-"))),
                 "world_size": start.get("world_size", "?"),
-                "run_id": run_id,
+                "run_id": worker_run_id,
                 "started_at": start.get("timestamp", ""),
                 "events": events,
                 "steps": [event for event in events if event.get("event") == "step"],
@@ -2082,8 +2089,8 @@ def write_node_page(host, workers, spans, resource_spans, output_file, run_id):
     )
 
 
-def build_dashboard(data_dir, output_file):
-    all_workers = load_workers(data_dir)
+def build_dashboard(data_dir, output_file, run_id=None):
+    all_workers = load_workers(data_dir, run_id=run_id)
     if not all_workers:
         raise FileNotFoundError(
             f"No metrics.jsonl files found under {data_dir}; run make collect first"
@@ -2332,7 +2339,7 @@ def build_dashboard(data_dir, output_file):
     )
 
 
-def visualization_files(source):
+def visualization_files(source, run_id=None):
     index = source / "index.html"
     collected = source / "collected"
     if not index.is_file() or not collected.is_dir():
@@ -2342,11 +2349,22 @@ def visualization_files(source):
         source / "plotly.min.js",
         *sorted((source / "nodes").glob("*.html")),
     ]
-    traces = [path for path in sorted(collected.rglob("*")) if path.is_file()]
+    if run_id:
+        run_directories = sorted(collected.glob(f"*/{run_id}"))
+        traces = [
+            path
+            for run_directory in run_directories
+            for path in sorted(run_directory.rglob("*"))
+            if path.is_file()
+        ]
+        if not traces:
+            raise FileNotFoundError(f"No collected traces found for run {run_id}")
+    else:
+        traces = [path for path in sorted(collected.rglob("*")) if path.is_file()]
     return [index, *(path for path in generated if path.is_file()), *traces]
 
 
-def upload_visualization(source, bucket_name, prefix, client=None):
+def upload_visualization(source, bucket_name, prefix, client=None, run_id=None):
     if client is None:
         try:
             from google.cloud import storage
@@ -2355,7 +2373,7 @@ def upload_visualization(source, bucket_name, prefix, client=None):
         client = storage.Client()
 
     bucket = client.bucket(bucket_name)
-    files = visualization_files(source)
+    files = visualization_files(source, run_id=run_id)
     report_object = f"{prefix.strip('/')}/index.html"
     for path in files:
         object_name = f"{prefix.strip('/')}/{path.relative_to(source).as_posix()}"
@@ -2407,6 +2425,7 @@ def parse_args():
         "--output", type=Path, default=Path("visualization/collected")
     )
     collect_parser.add_argument("--remote-dir", required=True)
+    collect_parser.add_argument("--run-id")
     build_parser = commands.add_parser("build")
     build_parser.add_argument(
         "--data", type=Path, default=Path("visualization/collected")
@@ -2414,6 +2433,7 @@ def parse_args():
     build_parser.add_argument(
         "--output", type=Path, default=Path("visualization/index.html")
     )
+    build_parser.add_argument("--run-id")
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--directory", type=Path, default=Path("visualization"))
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -2422,19 +2442,28 @@ def parse_args():
     upload_parser.add_argument("--source", type=Path, default=Path("visualization"))
     upload_parser.add_argument("--bucket", required=True)
     upload_parser.add_argument("--prefix", required=True)
+    upload_parser.add_argument("--run-id")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     if args.command == "collect":
-        collect(args.hostfile, args.source, args.output, args.remote_dir)
+        collect(
+            args.hostfile,
+            args.source,
+            args.output,
+            args.remote_dir,
+            run_id=args.run_id,
+        )
     elif args.command == "build":
-        build_dashboard(args.data, args.output)
+        build_dashboard(args.data, args.output, run_id=args.run_id)
     elif args.command == "serve":
         serve(args.directory, args.host, args.port)
     else:
-        upload_visualization(args.source, args.bucket, args.prefix)
+        upload_visualization(
+            args.source, args.bucket, args.prefix, run_id=args.run_id
+        )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-.PHONY: setup install cuda-check doctor hostfile-local deepspeed-env train train-hostfile-local train-multinode train-async train-async-hostfile-local train-async-multinode collect visualize serve upload test lint check clean
+.PHONY: setup install cuda-check doctor hostfile-local deepspeed-env train train-hostfile-local train-multinode train-async train-async-hostfile-local train-async-multinode collect visualize serve upload upload-existing test lint check clean
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
@@ -34,6 +34,8 @@ SERVE_HOST ?= 127.0.0.1
 PORT ?= 8000
 BUCKET ?= gbc-oit-rc-basil-app-bo-training-traces
 UPLOAD_PREFIX ?= $(shell hostname -s)_$(shell date -u +%Y%m%d_%H%M%S)
+COLLECT_RUN_ID ?=
+COLLECT_RUN_ARG = $(if $(COLLECT_RUN_ID),--run-id $(COLLECT_RUN_ID),)
 
 setup:
 	python3 -m venv $(VENV)
@@ -80,16 +82,20 @@ train-async-multinode: deepspeed-env
 	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) $(ASYNC_TRAIN) $(ASYNC_TRAIN_ARGS)
 
 collect:
-	$(PYTHON) $(VIS_DIR)/trace_tools.py collect --hostfile $(HOSTFILE) --source $(TRACE_DIR) --output $(VIS_DIR)/collected --remote-dir $(REMOTE_DIR)
+	$(PYTHON) $(VIS_DIR)/trace_tools.py collect --hostfile $(HOSTFILE) --source $(TRACE_DIR) --output $(VIS_DIR)/collected --remote-dir $(REMOTE_DIR) $(COLLECT_RUN_ARG)
 
 visualize: collect
-	$(PYTHON) $(VIS_DIR)/trace_tools.py build --data $(VIS_DIR)/collected --output $(VIS_DIR)/index.html
+	$(PYTHON) $(VIS_DIR)/trace_tools.py build --data $(VIS_DIR)/collected --output $(VIS_DIR)/index.html $(COLLECT_RUN_ARG)
 
 serve: visualize
 	$(PYTHON) $(VIS_DIR)/trace_tools.py serve --directory $(VIS_DIR) --host $(SERVE_HOST) --port $(PORT)
 
 upload: visualize
-	$(PYTHON) $(VIS_DIR)/trace_tools.py upload --source $(VIS_DIR) --bucket $(BUCKET) --prefix $(UPLOAD_PREFIX)
+	$(PYTHON) $(VIS_DIR)/trace_tools.py upload --source $(VIS_DIR) --bucket $(BUCKET) --prefix $(UPLOAD_PREFIX) $(COLLECT_RUN_ARG)
+
+upload-existing:
+	$(PYTHON) $(VIS_DIR)/trace_tools.py build --data $(VIS_DIR)/collected --output $(VIS_DIR)/index.html $(COLLECT_RUN_ARG)
+	$(PYTHON) $(VIS_DIR)/trace_tools.py upload --source $(VIS_DIR) --bucket $(BUCKET) --prefix $(UPLOAD_PREFIX) $(COLLECT_RUN_ARG)
 
 test:
 	$(PYTHON) -m pytest -q

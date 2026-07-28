@@ -796,6 +796,37 @@ def test_upload_file_list_contains_dashboard_and_collected_traces(tmp_path):
     ]
 
 
+def test_upload_file_list_can_select_one_run(tmp_path):
+    (tmp_path / "index.html").write_text("dashboard", encoding="utf-8")
+    selected = (
+        tmp_path
+        / "collected"
+        / "10.0.0.1"
+        / "run-2"
+        / "node-a"
+        / "rank-0"
+        / "metrics.jsonl"
+    )
+    selected.parent.mkdir(parents=True)
+    selected.write_text("{}", encoding="utf-8")
+    old = (
+        tmp_path
+        / "collected"
+        / "10.0.0.1"
+        / "run-1"
+        / "node-a"
+        / "rank-0"
+        / "metrics.jsonl"
+    )
+    old.parent.mkdir(parents=True)
+    old.write_text("{}", encoding="utf-8")
+
+    assert visualization_files(tmp_path, run_id="run-2") == [
+        tmp_path / "index.html",
+        selected,
+    ]
+
+
 def test_upload_uses_vm_and_timestamp_prefix(tmp_path):
     uploaded = []
 
