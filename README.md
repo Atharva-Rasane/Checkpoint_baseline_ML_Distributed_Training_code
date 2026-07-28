@@ -96,6 +96,7 @@ make train-hostfile-local MODEL=tiny_gpt STEPS=2
 ```
 
 `train-hostfile-local` detects the VM's GPU count and creates the local hostfile automatically.
+The setup also installs Ninja, which DeepSpeed uses to compile its CPU Adam optimizer for ZeRO offload.
 
 `make doctor` should show:
 

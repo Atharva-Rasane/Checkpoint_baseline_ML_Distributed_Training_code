@@ -3,5 +3,6 @@
 
 torch==2.13.0+cu126
 deepspeed==0.19.3
+ninja
 pytest
 ruff

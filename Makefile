@@ -25,6 +25,7 @@ cuda-check:
 doctor: cuda-check
 	$(PYTHON) --version
 	$(PYTHON) -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), 'cuda_version', torch.version.cuda, 'gpu_count', torch.cuda.device_count())"
+	$(PYTHON) -c "import ninja; print('ninja', ninja.__version__)"
 	$(DEEPSPEED) --version
 	nvidia-smi
 	$(CUDA_HOME)/bin/nvcc --version
