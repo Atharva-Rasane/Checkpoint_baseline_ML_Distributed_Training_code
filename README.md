@@ -159,7 +159,9 @@ Run a traced job and include at least one checkpoint:
 make train-hostfile-local MODEL=tiny_gpt STEPS=10 SAVE_EVERY=5 TRACE=1
 ```
 
-Each rank writes an operator timeline, graph execution trace, step metrics, GPU memory, and checkpoint events below `visualization/traces/<run-id>/<host>/rank-<rank>/`.
+`JOB` labels the CPU/GPU lanes and defaults to `MODEL`. Set it when multiple jobs use the same model, for example `JOB=pretrain-a`.
+
+Each rank writes wall-clock-aligned job spans, separate wall-clock CPU and CUDA-event GPU resource spans, an operator timeline, graph execution trace, step metrics, GPU memory, and checkpoint events below `visualization/traces/<run-id>/<host>/rank-<rank>/`.
 
 Collect traces from every host in `hostfile` and build the dashboard:
 
@@ -168,7 +170,12 @@ make collect
 make visualize
 ```
 
-`make visualize` already runs collection, so the shorter equivalent is:
+`make visualize` selects the newest collected run and creates:
+
+- `visualization/index.html`: aggregate activity, loss and latency, rank heatmap, checkpoints, and slow spans across every node.
+- `visualization/nodes/<host>.html`: detailed resource lanes, rank metrics, memory, checkpoints, and raw traces for one node.
+
+It already runs collection, so the shorter equivalent is:
 
 ```bash
 make visualize

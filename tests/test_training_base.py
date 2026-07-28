@@ -52,6 +52,17 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     worker_dir.mkdir(parents=True)
     events = [
         {"event": "run_start", "model": "tiny_gpt", "rank": 0, "world_size": 1},
+        {
+            "event": "span",
+            "host": "node",
+            "rank": 0,
+            "category": "Training",
+            "operation": "Forward",
+            "step": 1,
+            "start_ns": 1_000_000_000,
+            "end_ns": 1_005_000_000,
+            "duration_ms": 5,
+        },
         {"event": "step", "step": 1, "loss": 2.5, "duration_ms": 10, "cuda_peak_allocated_bytes": 100},
         {"event": "checkpoint_complete", "step": 1, "tag": "step-1", "duration_ms": 4, "output_dir": "checkpoints"},
     ]
@@ -59,11 +70,43 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
         "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
     )
     (worker_dir / "operator-trace.json").write_text("{}", encoding="utf-8")
+    resource_events = [
+        {
+            "event": "resource_span",
+            "host": "node",
+            "job": "tiny_gpt",
+            "rank": 0,
+            "category": "Training",
+            "operation": "Forward",
+            "resource": resource,
+            "start_ns": 1_000_000_000,
+            "end_ns": 1_005_000_000,
+            "duration_ms": duration,
+            "measurement": measurement,
+        }
+        for resource, duration, measurement in (
+            ("CPU", 5, "profiler_cpu_total"),
+            ("GPU", 4, "profiler_device_total"),
+        )
+    ]
+    (worker_dir / "resource-trace.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in resource_events), encoding="utf-8"
+    )
     output = tmp_path / "index.html"
 
     build_dashboard(tmp_path / "collected", output)
 
-    assert "tiny_gpt" in output.read_text(encoding="utf-8")
+    aggregate = output.read_text(encoding="utf-8")
+    node_page = tmp_path / "nodes" / "node.html"
+
+    assert "Aggregate Trace Explorer" in aggregate
+    assert "Cluster activity" in aggregate
+    assert node_page.is_file()
+    node_html = node_page.read_text(encoding="utf-8")
+    assert "Resource occupancy" in node_html
+    assert r"tiny_gpt \u002f rank 0 \u002f CPU" in node_html
+    assert r"tiny_gpt \u002f rank 0 \u002f GPU" in node_html
+    assert "CPU/GPU log" in node_html
 
 
 def test_hostfile_parser_ignores_slots_and_comments(tmp_path):
@@ -83,7 +126,7 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
         world_size=1,
         metadata={"model": "tiny_gpt"},
     )
-    with trace.region("test/operator"):
+    with trace.span("Training", "Forward", step=1):
         torch.ones(2) + 1
     trace.log("step", step=1, loss=1.0)
     trace.stop()
@@ -91,16 +134,29 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
     worker_dir = next(tmp_path.glob("run-1/*/rank-0"))
     assert (worker_dir / "operator-trace.json").stat().st_size > 0
     assert (worker_dir / "execution-trace.json").stat().st_size > 0
+    resource_events = (worker_dir / "resource-trace.jsonl").read_text(encoding="utf-8")
+    assert '"resource": "CPU"' in resource_events
+    assert '"operation": "Forward"' in resource_events
+    assert '"event": "span"' in (worker_dir / "metrics.jsonl").read_text(encoding="utf-8")
     assert '"event": "step"' in (worker_dir / "metrics.jsonl").read_text(encoding="utf-8")
 
 
 def test_upload_file_list_contains_dashboard_and_collected_traces(tmp_path):
     (tmp_path / "index.html").write_text("dashboard", encoding="utf-8")
+    (tmp_path / "plotly.min.js").write_text("plotly", encoding="utf-8")
+    node_page = tmp_path / "nodes" / "node-a.html"
+    node_page.parent.mkdir()
+    node_page.write_text("node", encoding="utf-8")
     trace = tmp_path / "collected" / "localhost" / "operator-trace.json"
     trace.parent.mkdir(parents=True)
     trace.write_text("{}", encoding="utf-8")
 
-    assert visualization_files(tmp_path) == [tmp_path / "index.html", trace]
+    assert visualization_files(tmp_path) == [
+        tmp_path / "index.html",
+        tmp_path / "plotly.min.js",
+        node_page,
+        trace,
+    ]
 
 
 def test_upload_uses_vm_and_timestamp_prefix(tmp_path):
