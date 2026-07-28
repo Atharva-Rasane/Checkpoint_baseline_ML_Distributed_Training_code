@@ -1,4 +1,6 @@
 import json
+import runpy
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +44,17 @@ def test_tiny_gpt_forward_returns_loss():
 
     assert output["loss"].ndim == 0
     assert output["logits"].shape == (2, 16, 128)
+
+
+def test_checkpoint_entrypoint_prefers_project_train_module(monkeypatch):
+    project_root = Path(__file__).resolve().parents[1]
+    wrapper_dir = project_root / "checkpointing" / "asynchronous"
+    monkeypatch.setattr(sys, "path", [str(wrapper_dir), str(project_root), *sys.path])
+
+    namespace = runpy.run_path(str(wrapper_dir / "train.py"), run_name="entrypoint_test")
+
+    assert sys.path[0] == str(project_root)
+    assert namespace["PROJECT_ROOT"] == project_root
 
 
 def test_synthetic_dataset_is_deterministic_by_sample():
