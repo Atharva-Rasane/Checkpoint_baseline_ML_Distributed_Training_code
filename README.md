@@ -161,6 +161,16 @@ make train-hostfile-local MODEL=tiny_gpt STEPS=10 SAVE_EVERY=5 TRACE=1
 
 `JOB` labels the CPU/GPU lanes and defaults to `MODEL`. Set it when multiple jobs use the same model, for example `JOB=pretrain-a`.
 
+Traced setup runs a 64 MiB per-node hardware probe by default. Change its transfer size with `BENCHMARK_MB`, for example:
+
+```bash
+make train-hostfile-local MODEL=tiny_gpt STEPS=10 TRACE=1 BENCHMARK_MB=128
+```
+
+The hardware profile records CPU and RAM capacity, GPU model/memory/compute capability, NIC interface and rated link speed, measured SSD sequential read/write, host-to-GPU, GPU-to-host, GPU DRAM copy, and distributed all-reduce payload/bus bandwidth. It also records model parameter bytes, estimated gradient bytes, checkpoint bytes/files/throughput, and per-step GPU/host telemetry.
+
+`make visualize` writes the collected simulator inputs to `visualization/simulator-profile.json`; `make upload` archives that JSON beside the standalone report and raw traces.
+
 Each rank writes wall-clock-aligned job spans, separate wall-clock CPU and CUDA-event GPU resource spans, an operator timeline, graph execution trace, step metrics, GPU memory, and checkpoint events below `visualization/traces/<run-id>/<host>/rank-<rank>/`.
 
 Collect traces from every host in `hostfile` and build the dashboard:
@@ -172,8 +182,8 @@ make visualize
 
 `make visualize` selects the newest collected run and creates:
 
-- `visualization/index.html`: a self-contained report with embedded Plotly, aggregate activity, loss and latency, telemetry, CPU operators, GPU kernels, NCCL operations, checkpoints, slow spans, and every node's detailed views.
-- `visualization/nodes/<host>.html`: separate detailed resource lanes, rank metrics, memory, telemetry, operators, checkpoints, and raw traces for one node.
+- `visualization/index.html`: a self-contained report with embedded Plotly, absolute UTC node alignment, aggregate CPU/GPU/storage activity, loss and latency, telemetry, hardware profiles, CPU operators, GPU kernels, NCCL operations, checkpoints, slow spans, and every node's detailed views.
+- `visualization/nodes/<host>.html`: separate absolute-time forward/backward/optimizer lanes plus detailed CPU operation, GPU kernel, and gradient/NCCL synchronization timelines for one node.
 
 It already runs collection, so the shorter equivalent is:
 

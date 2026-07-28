@@ -11,12 +11,13 @@ MODEL ?= tiny_gpt
 JOB ?= $(MODEL)
 STEPS ?= 100
 SAVE_EVERY ?= 100
+BENCHMARK_MB ?= 64
 MASTER_ADDR ?= localhost
 TRACE ?= 0
 TRACE_DIR ?= visualization/traces
 RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 TRACE_ARGS = $(if $(filter 1 true yes,$(TRACE)),--trace --trace_dir $(TRACE_DIR) --run_id $(RUN_ID),)
-TRAIN_ARGS = --model_name $(MODEL) --job_name $(JOB) --steps $(STEPS) --save_every $(SAVE_EVERY) $(TRACE_ARGS)
+TRAIN_ARGS = --model_name $(MODEL) --job_name $(JOB) --steps $(STEPS) --save_every $(SAVE_EVERY) --hardware_benchmark_mb $(BENCHMARK_MB) $(TRACE_ARGS)
 VIS_DIR ?= visualization
 REMOTE_DIR ?= $(CURDIR)
 SERVE_HOST ?= 127.0.0.1
@@ -77,4 +78,4 @@ lint:
 check: lint test
 
 clean:
-	rm -rf .pytest_cache .ruff_cache __pycache__ llm_models/__pycache__ tests/__pycache__ checkpoints visualization/traces visualization/collected visualization/nodes visualization/index.html visualization/plotly.min.js
+	rm -rf .pytest_cache .ruff_cache __pycache__ llm_models/__pycache__ tests/__pycache__ checkpoints visualization/traces visualization/collected visualization/nodes visualization/index.html visualization/plotly.min.js visualization/simulator-profile.json

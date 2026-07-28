@@ -1,4 +1,5 @@
 import argparse
+import heapq
 import html
 import json
 import math
@@ -10,6 +11,7 @@ import socket
 import subprocess
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
@@ -55,6 +57,12 @@ COMMUNICATION_TERMS = (
     "send",
     "recv",
 )
+RESOURCE_COLORS = {
+    "CPU": "#2563eb",
+    "GPU": "#0f8a72",
+    "Storage": "#e36a2e",
+    "Network": "#7c3aed",
+}
 
 
 def read_hosts(hostfile):
@@ -109,6 +117,25 @@ def _read_jsonl(path):
     return events
 
 
+def _timestamp_ns(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return int(parsed.timestamp()) * 1_000_000_000 + parsed.microsecond * 1000
+
+
+def _iso_from_ns(value):
+    return datetime.fromtimestamp(int(value) / 1_000_000_000, timezone.utc).isoformat(
+        timespec="microseconds"
+    )
+
+
 def summarize_operator_trace(path):
     summary = {
         "cpu": Counter(),
@@ -117,25 +144,66 @@ def summarize_operator_trace(path):
         "counts": Counter(),
         "memory_peak_bytes": 0,
         "memory_events": 0,
+        "timeline_events": [],
     }
     try:
+        base_time_ns = None
+        with path.open("rb") as trace_file:
+            for prefix, event_type, value in ijson.parse(trace_file):
+                if prefix == "baseTimeNanoseconds":
+                    base_time_ns = int(value)
+                if prefix == "traceEvents" and event_type == "start_array":
+                    break
+
+        timeline_heaps = {"CPU": [], "GPU": [], "Communication": []}
+        sequence = 0
         with path.open("rb") as trace_file:
             for event in ijson.items(trace_file, "traceEvents.item"):
                 name = str(event.get("name") or "unknown")
                 category = str(event.get("cat") or "").lower()
                 duration_us = float(event.get("dur") or 0)
                 lower_name = name.lower()
-                if category == "cpu_op":
+                is_cpu = category == "cpu_op"
+                is_gpu = category in {"kernel", "gpu_memcpy", "gpu_memset"}
+                is_communication = category in {
+                    "cpu_op",
+                    "kernel",
+                    "user_annotation",
+                    "cuda_runtime",
+                } and any(term in lower_name for term in COMMUNICATION_TERMS)
+                if is_cpu:
                     summary["cpu"][name] += duration_us
                     summary["counts"]["cpu"] += 1
-                if category in {"kernel", "gpu_memcpy", "gpu_memset"}:
+                if is_gpu:
                     summary["gpu"][name] += duration_us
                     summary["counts"]["gpu"] += 1
-                if category in {"cpu_op", "kernel", "user_annotation", "cuda_runtime"} and any(
-                    term in lower_name for term in COMMUNICATION_TERMS
-                ):
+                if is_communication:
                     summary["communication"][name] += duration_us
                     summary["counts"]["communication"] += 1
+                if event.get("ph") == "X" and (is_cpu or is_gpu or is_communication):
+                    resource_name = (
+                        "Communication" if is_communication else "GPU" if is_gpu else "CPU"
+                    )
+                    trace_timestamp_us = float(event.get("ts") or 0)
+                    timeline_event = {
+                        "name": name,
+                        "resource": resource_name,
+                        "duration_us": duration_us,
+                        "start_ns": (
+                            base_time_ns + int(trace_timestamp_us * 1000)
+                            if base_time_ns is not None
+                            else None
+                        ),
+                        "trace_timestamp_us": trace_timestamp_us,
+                    }
+                    item = (duration_us, sequence, timeline_event)
+                    timeline_heap = timeline_heaps[resource_name]
+                    limit = 5000 if resource_name == "Communication" else 3000
+                    if len(timeline_heap) < limit:
+                        heapq.heappush(timeline_heap, item)
+                    elif duration_us > timeline_heap[0][0]:
+                        heapq.heapreplace(timeline_heap, item)
+                    sequence += 1
                 if name == "[memory]":
                     args = event.get("args") or {}
                     if int(args.get("Device Type") or 0) == 1:
@@ -144,6 +212,16 @@ def summarize_operator_trace(path):
                             int(args.get("Total Allocated") or 0),
                         )
                         summary["memory_events"] += 1
+        summary["timeline_events"] = [
+            item[2]
+            for item in sorted(
+                [item for timeline_heap in timeline_heaps.values() for item in timeline_heap],
+                key=lambda item: (
+                    item[2]["start_ns"] or item[2]["trace_timestamp_us"],
+                    item[1],
+                ),
+            )
+        ]
     except (OSError, ijson.JSONError, ValueError):
         summary["parse_error"] = True
     return summary
@@ -173,6 +251,10 @@ def load_workers(data_dir):
                 "checkpoints": [
                     event for event in events if event.get("event") == "checkpoint_complete"
                 ],
+                "hardware": next(
+                    (event for event in events if event.get("event") == "hardware_profile"),
+                    {},
+                ),
                 "operator_trace": operator_trace if operator_trace.exists() else None,
                 "operator_summary": summarize_operator_trace(operator_trace),
                 "execution_trace": (
@@ -217,6 +299,7 @@ def _resource(category):
 def build_spans(workers):
     raw_spans = []
     for worker in workers:
+        worker_start_ns = _timestamp_ns(worker["started_at"])
         structured = [event for event in worker["events"] if event.get("event") == "span"]
         if structured:
             for event in structured:
@@ -229,8 +312,12 @@ def build_spans(workers):
         for event in worker["events"]:
             if event.get("event") == "step":
                 duration = float(event.get("duration_ms") or 0.0)
-                start_ns = event.get("start_ns")
-                end_ns = event.get("end_ns")
+                start_ns = event.get("start_ns") or (
+                    worker_start_ns + int(cursor_ms * 1_000_000) if worker_start_ns else None
+                )
+                end_ns = event.get("end_ns") or (
+                    int(start_ns) + int(duration * 1_000_000) if start_ns else None
+                )
                 raw_spans.append(
                     {
                         **event,
@@ -248,14 +335,19 @@ def build_spans(workers):
                 cursor_ms += duration
             elif event.get("event") == "checkpoint_complete":
                 duration = float(event.get("duration_ms") or 0.0)
+                start_ns = (
+                    worker_start_ns + int(cursor_ms * 1_000_000) if worker_start_ns else None
+                )
                 raw_spans.append(
                     {
                         **event,
                         "event": "span",
                         "category": "Checkpoint",
                         "operation": "Save checkpoint",
-                        "start_ns": None,
-                        "end_ns": None,
+                        "start_ns": start_ns,
+                        "end_ns": (
+                            int(start_ns) + int(duration * 1_000_000) if start_ns else None
+                        ),
                         "synthetic_start_ms": cursor_ms,
                         "duration_ms": duration,
                         "worker": worker["worker"],
@@ -270,11 +362,14 @@ def build_spans(workers):
     for span in raw_spans:
         duration_ms = float(span.get("duration_ms") or 0.0)
         if span.get("start_ns") is not None:
-            start_s = (int(span["start_ns"]) - base_ns) / 1_000_000_000
+            start_ns = int(span["start_ns"])
+            start_s = (start_ns - base_ns) / 1_000_000_000
             if span.get("end_ns") is not None:
-                duration_ms = (int(span["end_ns"]) - int(span["start_ns"])) / 1_000_000
+                duration_ms = (int(span["end_ns"]) - start_ns) / 1_000_000
         else:
+            start_ns = base_ns + int(float(span.get("synthetic_start_ms") or 0.0) * 1_000_000)
             start_s = float(span.get("synthetic_start_ms") or 0.0) / 1000
+        end_ns = start_ns + int(max(0.0, duration_ms) * 1_000_000)
         category = str(span.get("category") or "Other")
         spans.append(
             {
@@ -285,6 +380,10 @@ def build_spans(workers):
                 "start_s": start_s,
                 "duration_s": max(0.0, duration_ms / 1000),
                 "end_s": start_s + max(0.0, duration_ms / 1000),
+                "start_epoch_s": start_ns / 1_000_000_000,
+                "end_epoch_s": end_ns / 1_000_000_000,
+                "start_utc": _iso_from_ns(start_ns),
+                "end_utc": _iso_from_ns(end_ns),
             }
         )
     return spans
@@ -299,32 +398,46 @@ def build_resource_spans(workers, logical_spans):
     base_ns = min(timestamps, default=0)
     resource_spans = []
     for worker in workers:
+        worker_resource_count = 0
         path = worker["resource_trace"]
-        if path is None:
-            continue
-        for event in _read_jsonl(path):
-            if event.get("event") != "resource_span":
-                continue
-            start_s = (
-                (int(event["start_ns"]) - base_ns) / 1_000_000_000
-                if event.get("start_ns") is not None
-                else 0.0
-            )
-            duration_s = max(0.0, float(event.get("duration_ms") or 0) / 1000)
-            resource_spans.append(
+        if path is not None:
+            for event in _read_jsonl(path):
+                if event.get("event") != "resource_span":
+                    continue
+                start_s = (
+                    (int(event["start_ns"]) - base_ns) / 1_000_000_000
+                    if event.get("start_ns") is not None
+                    else 0.0
+                )
+                duration_s = max(0.0, float(event.get("duration_ms") or 0) / 1000)
+                start_ns = int(event.get("start_ns") or base_ns)
+                end_ns = start_ns + int(duration_s * 1_000_000_000)
+                resource_spans.append(
+                    {
+                        **event,
+                        "worker": worker["worker"],
+                        "host": worker["host"],
+                        "job": worker["job"],
+                        "start_s": start_s,
+                        "duration_s": duration_s,
+                        "end_s": start_s + duration_s,
+                        "start_epoch_s": start_ns / 1_000_000_000,
+                        "end_epoch_s": end_ns / 1_000_000_000,
+                        "start_utc": _iso_from_ns(start_ns),
+                        "end_utc": _iso_from_ns(end_ns),
+                    }
+                )
+                worker_resource_count += 1
+        if worker_resource_count == 0:
+            resource_spans.extend(
                 {
-                    **event,
-                    "worker": worker["worker"],
-                    "host": worker["host"],
-                    "job": worker["job"],
-                    "start_s": start_s,
-                    "duration_s": duration_s,
-                    "end_s": start_s + duration_s,
+                    **span,
+                    "job": span.get("job", worker["job"]),
                 }
+                for span in logical_spans
+                if span["worker"] == worker["worker"]
             )
-    if resource_spans:
-        return resource_spans
-    return [{**span, "job": span.get("job", "training")} for span in logical_spans]
+    return resource_spans
 
 
 def _figure_html(figure, div_id):
@@ -363,8 +476,8 @@ def resource_timeline(spans, host):
                 name=operation,
                 orientation="h",
                 y=[f"{row['job']} / rank {row['rank']} / {row['resource']}" for row in rows],
-                x=[row["duration_s"] for row in rows],
-                base=[row["start_s"] for row in rows],
+                x=[row["duration_s"] * 1000 for row in rows],
+                base=[row["start_utc"] for row in rows],
                 marker={
                     "color": OPERATION_COLORS.get(
                         operation, CATEGORY_COLORS.get(rows[0]["category"], "#64748b")
@@ -378,12 +491,13 @@ def resource_timeline(spans, host):
                         row["duration_s"] * 1000,
                         row.get("status", "ok"),
                         row.get("measurement", "wall_clock"),
+                        row["start_utc"],
                     ]
                     for row in rows
                 ],
                 hovertemplate=(
                     "operation=%{fullData.name}<br>category=%{customdata[0]}"
-                    "<br>step=%{customdata[1]}<br>start=%{base:.6f}s"
+                    "<br>step=%{customdata[1]}<br>start UTC=%{customdata[5]}"
                     "<br>duration=%{customdata[2]:.3f}ms"
                     "<br>status=%{customdata[3]}<br>measurement=%{customdata[4]}<extra></extra>"
                 ),
@@ -399,11 +513,216 @@ def resource_timeline(spans, host):
             "barmode": "overlay",
             "bargap": 0.18,
             "xaxis": {
-                "title": "Time from trace start (seconds)",
+                "title": "Absolute UTC time",
+                "type": "date",
+                "tickformat": "%H:%M:%S.%L<br>%Y-%m-%d",
                 "rangeslider": {"visible": True, "thickness": 0.07},
             },
             "yaxis": {
                 "title": "Rank resource",
+                "categoryorder": "array",
+                "categoryarray": lanes,
+                "autorange": "reversed",
+                "automargin": True,
+            },
+        }
+    )
+    figure.update_layout(**layout)
+    return figure
+
+
+def cross_node_alignment_figure(workers, spans):
+    rows = []
+    starts = []
+    for worker in workers:
+        worker_spans = [span for span in spans if span["worker"] == worker["worker"]]
+        fallback_start = min((span["start_epoch_s"] for span in worker_spans), default=0)
+        start_ns = _timestamp_ns(worker["started_at"])
+        start_epoch = start_ns / 1_000_000_000 if start_ns else fallback_start
+        end_epoch = max((span["end_epoch_s"] for span in worker_spans), default=start_epoch)
+        starts.append(start_epoch)
+        rows.append((worker, start_epoch, end_epoch))
+    earliest = min(starts, default=0)
+    figure = go.Figure(
+        go.Bar(
+            name="Process lifetime",
+            orientation="h",
+            y=[row[0]["worker"] for row in rows],
+            x=[(row[2] - row[1]) * 1000 for row in rows],
+            base=[
+                datetime.fromtimestamp(row[1], timezone.utc).isoformat(timespec="microseconds")
+                for row in rows
+            ],
+            marker={"color": "#2563eb"},
+            customdata=[
+                [
+                    datetime.fromtimestamp(row[1], timezone.utc).isoformat(timespec="microseconds"),
+                    (row[1] - earliest) * 1000,
+                    (row[2] - row[1]) * 1000,
+                    row[0]["host"],
+                ]
+                for row in rows
+            ],
+            hovertemplate=(
+                "worker=%{y}<br>host=%{customdata[3]}<br>start UTC=%{customdata[0]}"
+                "<br>start offset=%{customdata[1]:.3f}ms"
+                "<br>recorded lifetime=%{customdata[2]:.3f}ms<extra></extra>"
+            ),
+        )
+    )
+    layout = _layout("Cross-node trace start alignment", max(400, 34 * len(rows) + 220))
+    layout.update(
+        {
+            "xaxis": {
+                "title": "Absolute UTC time",
+                "type": "date",
+                "tickformat": "%H:%M:%S.%L<br>%Y-%m-%d",
+                "rangeslider": {"visible": True, "thickness": 0.08},
+            },
+            "yaxis": {"title": "Worker", "automargin": True, "autorange": "reversed"},
+        }
+    )
+    figure.update_layout(**layout)
+    return figure
+
+
+def resource_activity_figure(spans, buckets=200):
+    figure = go.Figure()
+    if not spans:
+        figure.update_layout(**_layout("CPU, GPU, storage, and network activity"))
+        return figure
+    start_epoch = min(span["start_epoch_s"] for span in spans)
+    end_epoch = max(span["end_epoch_s"] for span in spans)
+    width = max((end_epoch - start_epoch) / buckets, 1e-6)
+    centers = [
+        datetime.fromtimestamp(start_epoch + (index + 0.5) * width, timezone.utc).isoformat(
+            timespec="microseconds"
+        )
+        for index in range(buckets)
+    ]
+    values = {resource_name: [0.0] * buckets for resource_name in RESOURCE_COLORS}
+    for span in spans:
+        first = max(0, min(buckets - 1, int((span["start_epoch_s"] - start_epoch) / width)))
+        last = max(
+            0,
+            min(
+                buckets - 1,
+                int((max(span["start_epoch_s"], span["end_epoch_s"] - 1e-12) - start_epoch) / width),
+            ),
+        )
+        resource_name = span.get("resource", "CPU")
+        values.setdefault(resource_name, [0.0] * buckets)
+        for index in range(first, last + 1):
+            left = start_epoch + index * width
+            right = left + width
+            overlap = max(
+                0.0,
+                min(span["end_epoch_s"], right) - max(span["start_epoch_s"], left),
+            )
+            values[resource_name][index] += overlap / width
+    for resource_name, color in RESOURCE_COLORS.items():
+        if not any(values.get(resource_name, [])):
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=centers,
+                y=values[resource_name],
+                name=resource_name,
+                mode="lines",
+                stackgroup="resources",
+                line={"color": color, "width": 1},
+                hovertemplate=(
+                    "UTC=%{x}<br>active resource-equivalents=%{y:.2f}"
+                    "<extra>%{fullData.name}</extra>"
+                ),
+            )
+        )
+    figure.update_layout(**_layout("CPU, GPU, storage, and network activity", 470))
+    figure.update_xaxes(
+        title="Absolute UTC time",
+        type="date",
+        tickformat="%H:%M:%S.%L<br>%Y-%m-%d",
+    )
+    figure.update_yaxes(title="Active resource-equivalents")
+    return figure
+
+
+def operator_timeline_figure(workers, title):
+    rows = []
+    for worker in workers:
+        events = worker["operator_summary"].get("timeline_events", [])
+        fallback_ns = _timestamp_ns(worker["started_at"])
+        trace_origin = min((event["trace_timestamp_us"] for event in events), default=0)
+        for event in events:
+            start_ns = event.get("start_ns")
+            if start_ns is None and fallback_ns is not None:
+                start_ns = fallback_ns + int(
+                    (event["trace_timestamp_us"] - trace_origin) * 1000
+                )
+            if start_ns is None:
+                continue
+            rows.append(
+                {
+                    **event,
+                    "worker": worker["worker"],
+                    "rank": worker["rank"],
+                    "job": worker["job"],
+                    "start_ns": start_ns,
+                    "start_utc": _iso_from_ns(start_ns),
+                }
+            )
+    rows = [
+        row
+        for resource_name in ("CPU", "GPU", "Communication")
+        for row in heapq.nlargest(
+            5000 if resource_name == "Communication" else 3000,
+            (item for item in rows if item["resource"] == resource_name),
+            key=lambda item: item["duration_us"],
+        )
+    ]
+    rows.sort(key=lambda row: row["start_ns"])
+    figure = go.Figure()
+    for resource_name in ("CPU", "GPU", "Communication"):
+        resource_rows = [row for row in rows if row["resource"] == resource_name]
+        if not resource_rows:
+            continue
+        lane_name = "Gradient/NCCL sync" if resource_name == "Communication" else resource_name
+        figure.add_trace(
+            go.Bar(
+                name=lane_name,
+                orientation="h",
+                y=[f"{row['job']} / rank {row['rank']} / {lane_name}" for row in resource_rows],
+                x=[row["duration_us"] / 1000 for row in resource_rows],
+                base=[row["start_utc"] for row in resource_rows],
+                marker={"color": RESOURCE_COLORS.get(resource_name, "#7c3aed")},
+                customdata=[
+                    [row["name"], row["start_utc"], row["duration_us"], row["worker"]]
+                    for row in resource_rows
+                ],
+                hovertemplate=(
+                    "operation=%{customdata[0]}<br>worker=%{customdata[3]}"
+                    "<br>start UTC=%{customdata[1]}<br>duration=%{customdata[2]:.3f}us"
+                    "<extra>%{fullData.name}</extra>"
+                ),
+            )
+        )
+    lanes = sorted(
+        {trace.y[index] for trace in figure.data for index in range(len(trace.y))},
+        key=lambda lane: (int(re.search(r"rank (\d+)", lane).group(1)), lane),
+    )
+    layout = _layout(title, max(500, 42 * len(lanes) + 220))
+    layout.update(
+        {
+            "barmode": "overlay",
+            "bargap": 0.14,
+            "xaxis": {
+                "title": "Absolute UTC time",
+                "type": "date",
+                "tickformat": "%H:%M:%S.%L<br>%Y-%m-%d",
+                "rangeslider": {"visible": True, "thickness": 0.07},
+            },
+            "yaxis": {
+                "title": "Job / rank / resource",
                 "categoryorder": "array",
                 "categoryarray": lanes,
                 "autorange": "reversed",
@@ -562,15 +881,28 @@ def aggregate_activity_figure(spans, buckets=160):
     if not spans:
         figure.update_layout(**_layout("Cluster activity"))
         return figure
+    start = min(span["start_s"] for span in spans)
     end = max(span["end_s"] for span in spans)
-    width = max(end / buckets, 1e-6)
-    centers = [(index + 0.5) * width for index in range(buckets)]
+    start_epoch = min(span["start_epoch_s"] for span in spans)
+    width = max((end - start) / buckets, 1e-6)
+    centers = [
+        datetime.fromtimestamp(start_epoch + (index + 0.5) * width, timezone.utc).isoformat(
+            timespec="microseconds"
+        )
+        for index in range(buckets)
+    ]
     values = {category: [0.0] * buckets for category in CATEGORY_COLORS}
     for span in spans:
-        first = max(0, min(buckets - 1, int(span["start_s"] / width)))
-        last = max(0, min(buckets - 1, int(max(span["start_s"], span["end_s"] - 1e-12) / width)))
+        first = max(0, min(buckets - 1, int((span["start_s"] - start) / width)))
+        last = max(
+            0,
+            min(
+                buckets - 1,
+                int((max(span["start_s"], span["end_s"] - 1e-12) - start) / width),
+            ),
+        )
         for index in range(first, last + 1):
-            left = index * width
+            left = start + index * width
             right = left + width
             overlap = max(0.0, min(span["end_s"], right) - max(span["start_s"], left))
             values.setdefault(span["category"], [0.0] * buckets)[index] += overlap / width
@@ -586,13 +918,17 @@ def aggregate_activity_figure(spans, buckets=160):
                 stackgroup="activity",
                 line={"color": color, "width": 1},
                 hovertemplate=(
-                    "time=%{x:.4f}s<br>active rank-equivalents=%{y:.2f}"
+                    "UTC=%{x}<br>active rank-equivalents=%{y:.2f}"
                     "<extra>%{fullData.name}</extra>"
                 ),
             )
         )
     figure.update_layout(**_layout("Cluster activity by category", 460))
-    figure.update_xaxes(title="Time from trace start (seconds)")
+    figure.update_xaxes(
+        title="Absolute UTC time",
+        type="date",
+        tickformat="%H:%M:%S.%L<br>%Y-%m-%d",
+    )
     figure.update_yaxes(title="Active rank-equivalents")
     return figure
 
@@ -670,6 +1006,68 @@ def _percentile(values, percentile):
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def write_simulator_profile(path, run_id, workers, spans):
+    phase_durations = defaultdict(list)
+    for span in spans:
+        phase_durations[span["operation"]].append(span["duration_s"] * 1000)
+    nodes = {}
+    for host in sorted({worker["host"] for worker in workers}):
+        host_workers = [worker for worker in workers if worker["host"] == host]
+        step_durations = [
+            float(step.get("duration_ms") or 0)
+            for worker in host_workers
+            for step in worker["steps"]
+        ]
+        nodes[host] = {
+            "step_latency_ms": {
+                "count": len(step_durations),
+                "mean": sum(step_durations) / len(step_durations) if step_durations else 0,
+                "p50": _percentile(step_durations, 0.5),
+                "p95": _percentile(step_durations, 0.95),
+            },
+            "ranks": [
+                {
+                    "rank": worker["rank"],
+                    "job": worker["job"],
+                    "hardware": worker["hardware"],
+                }
+                for worker in sorted(host_workers, key=lambda item: item["rank"])
+            ],
+        }
+    checkpoint_events = [
+        {
+            "worker": worker["worker"],
+            "step": checkpoint.get("step"),
+            "duration_ms": checkpoint.get("duration_ms"),
+            "size_bytes": checkpoint.get("checkpoint_size_bytes", 0),
+            "file_count": checkpoint.get("checkpoint_file_count", 0),
+            "throughput_mib_s": checkpoint.get("checkpoint_throughput_mib_s", 0),
+        }
+        for worker in workers
+        for checkpoint in worker["checkpoints"]
+    ]
+    profile = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "model": workers[0]["model"],
+        "world_size": len(workers),
+        "trace_start_utc": min((span["start_utc"] for span in spans), default=None),
+        "trace_duration_s": max((span["end_s"] for span in spans), default=0),
+        "phase_duration_ms": {
+            operation: {
+                "count": len(durations),
+                "mean": sum(durations) / len(durations),
+                "p50": _percentile(durations, 0.5),
+                "p95": _percentile(durations, 0.95),
+            }
+            for operation, durations in sorted(phase_durations.items())
+        },
+        "checkpoints": checkpoint_events,
+        "nodes": nodes,
+    }
+    path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _cards(items):
     return "".join(
         f'<div class="metric"><span>{html.escape(str(label))}</span>'
@@ -734,12 +1132,63 @@ def _checkpoint_table(workers):
     return "".join(rows) or '<tr><td colspan="8" class="empty">No checkpoints recorded.</td></tr>'
 
 
+def _profile_number(profile, name, scale=1.0, suffix=""):
+    value = profile.get(name)
+    return f"{float(value) / scale:,.2f}{suffix}" if value is not None else "-"
+
+
+def _hardware_table(workers):
+    rows = []
+    for worker in sorted(workers, key=lambda item: (item["host"], item["rank"])):
+        profile = worker["hardware"]
+        if not profile:
+            continue
+
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(worker['host'])}</td><td>{worker['rank']}</td>"
+            f"<td>{html.escape(str(profile.get('gpu_name', '-')))}</td>"
+            f"<td>{_profile_number(profile, 'gpu_total_memory_bytes', 1024**3, ' GiB')}</td>"
+            f"<td>{html.escape(str(profile.get('cpu_model', '-')))}</td>"
+            f"<td>{profile.get('cpu_count', '-')}</td>"
+            f"<td>{_profile_number(profile, 'host_memory_bytes', 1024**3, ' GiB')}</td>"
+            f"<td>{html.escape(str(profile.get('network_interface', '-')))}</td>"
+            f"<td>{_profile_number(profile, 'nic_link_speed_mbps', 1000, ' Gbps')}</td>"
+            f"<td>{_profile_number(profile, 'storage_write_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'storage_read_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'host_to_gpu_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'gpu_to_host_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'gpu_dram_copy_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'gpu_dram_theoretical_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'all_reduce_payload_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'all_reduce_bus_gbps', suffix=' GB/s')}</td>"
+            f"<td>{_profile_number(profile, 'all_reduce_average_ms', suffix=' ms')}</td>"
+            f"<td>{_profile_number(profile, 'model_parameter_bytes', 1024**3, ' GiB')}</td>"
+            f"<td>{_profile_number(profile, 'gradient_bytes_estimate', 1024**3, ' GiB')}</td>"
+            "</tr>"
+        )
+    return "".join(rows) or (
+        '<tr><td colspan="20" class="empty">No hardware profile in this trace.</td></tr>'
+    )
+
+
+HARDWARE_TABLE_HEADER = (
+    "<th>Node</th><th>Rank</th><th>GPU</th><th>GPU memory</th><th>CPU</th>"
+    "<th>CPU cores</th><th>Host RAM</th><th>NIC</th><th>NIC link</th>"
+    "<th>SSD write</th><th>SSD read</th><th>Host to GPU</th><th>GPU to host</th>"
+    "<th>GPU DRAM measured</th><th>GPU DRAM theoretical</th>"
+    "<th>All-reduce payload</th><th>All-reduce bus</th><th>All-reduce latency</th>"
+    "<th>Parameters</th><th>Gradients estimate</th>"
+)
+
+
 def _slow_span_table(spans, limit=100):
     rows = []
     for span in sorted(spans, key=lambda item: item["duration_s"], reverse=True)[:limit]:
         rows.append(
             "<tr>"
-            f"<td>{span['start_s']:.6f} s</td><td>{span['duration_s'] * 1000:.3f} ms</td>"
+            f"<td>{html.escape(span['start_utc'])}</td><td>{span['start_s']:.6f} s</td>"
+            f"<td>{span['duration_s'] * 1000:.3f} ms</td>"
             f"<td>{html.escape(span['worker'])}</td><td>{html.escape(span['category'])}</td>"
             f"<td>{html.escape(span['operation'])}</td><td>{span.get('step', '-')}</td>"
             f"<td>{html.escape(str(span.get('status', 'ok')))}</td></tr>"
@@ -793,6 +1242,11 @@ def node_body(host, workers, spans, resource_spans, page, run_id, prefix, headin
         (float(step.get("cuda_peak_allocated_bytes") or 0) for step in all_steps),
         default=0,
     )
+    global_start = min((span["start_epoch_s"] for span in spans), default=0)
+    host_start = min((span["start_epoch_s"] for span in host_spans), default=global_start)
+    host_start_utc = datetime.fromtimestamp(host_start, timezone.utc).isoformat(
+        timespec="milliseconds"
+    )
     heading_html = (
         f'<div id="node-{safe_name(host)}" class="node-report"><h2>Node trace: '
         f'{html.escape(host)}</h2><p class="subtitle">{html.escape(workers[0]["model"])} | '
@@ -806,6 +1260,8 @@ def node_body(host, workers, spans, resource_spans, page, run_id, prefix, headin
         + _cards(
             [
                 ("Run", run_id),
+                ("Node start UTC", host_start_utc),
+                ("Start offset", f"{(host_start - global_start) * 1000:.3f} ms"),
                 ("Ranks", len(workers)),
                 ("Recorded steps", len(all_steps)),
                 ("P95 step", f"{_percentile(durations, 0.95):.3f} ms"),
@@ -817,12 +1273,27 @@ def node_body(host, workers, spans, resource_spans, page, run_id, prefix, headin
         + '<section><h2>Resource occupancy</h2>'
         + _figure_html(resource_timeline(host_resource_spans, host), f"{prefix}-resource-timeline")
         + "</section>"
+        + '<section><h2>CPU, GPU, and gradient synchronization timeline</h2>'
+        + _figure_html(
+            operator_timeline_figure(
+                workers,
+                f"{host} CPU operations, GPU kernels, and gradient/NCCL synchronization",
+            ),
+            f"{prefix}-operator-timeline",
+        )
+        + "</section>"
         + '<section><h2>Step performance</h2>'
         + _figure_html(
             step_performance_figure(workers, "Loss and latency by rank"),
             f"{prefix}-step-performance",
         )
         + "</section>"
+        + '<section><h2>Simulator hardware profile</h2><div class="table-wrap"><table>'
+        + "<thead><tr>"
+        + HARDWARE_TABLE_HEADER
+        + "</tr></thead><tbody>"
+        + _hardware_table(workers)
+        + "</tbody></table></div></section>"
         + '<section><h2>CUDA memory</h2>'
         + _figure_html(memory_figure(workers), f"{prefix}-cuda-memory")
         + "</section>"
@@ -853,7 +1324,8 @@ def node_body(host, workers, spans, resource_spans, page, run_id, prefix, headin
         + _checkpoint_table(workers)
         + "</tbody></table></div></section>"
         + '<section><h2>Slow-span explorer</h2><div class="table-wrap"><table><thead><tr>'
-        + "<th>Start</th><th>Duration</th><th>Worker</th><th>Category</th><th>Operation</th>"
+        + "<th>Start UTC</th><th>Offset</th><th>Duration</th><th>Worker</th>"
+        + "<th>Category</th><th>Operation</th>"
         + "<th>Step</th><th>Status</th></tr></thead><tbody>"
         + _slow_span_table(host_spans)
         + "</tbody></table></div></section>"
@@ -893,6 +1365,12 @@ def build_dashboard(data_dir, output_file):
     spans = build_spans(workers)
     resource_spans = build_resource_spans(workers, spans)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    write_simulator_profile(
+        output_file.parent / "simulator-profile.json",
+        run_id,
+        workers,
+        spans,
+    )
     nodes_dir = output_file.parent / "nodes"
     if nodes_dir.exists():
         shutil.rmtree(nodes_dir)
@@ -938,11 +1416,27 @@ def build_dashboard(data_dir, output_file):
         for worker in workers
         for checkpoint in worker["checkpoints"]
     )
+    trace_start_epoch = min((span["start_epoch_s"] for span in spans), default=0)
+    trace_start_utc = datetime.fromtimestamp(trace_start_epoch, timezone.utc).isoformat(
+        timespec="milliseconds"
+    )
+    worker_start_epochs = []
+    for worker in workers:
+        start_ns = _timestamp_ns(worker["started_at"])
+        if start_ns is not None:
+            worker_start_epochs.append(start_ns / 1_000_000_000)
+    start_skew_ms = (
+        (max(worker_start_epochs) - min(worker_start_epochs)) * 1000
+        if worker_start_epochs
+        else 0
+    )
     body = (
         '<div class="metrics">'
         + _cards(
             [
                 ("Run", run_id),
+                ("Trace start UTC", trace_start_utc),
+                ("Node start skew", f"{start_skew_ms:.3f} ms"),
                 ("Nodes", len(by_host)),
                 ("Ranks", len(workers)),
                 ("Trace duration", f"{trace_duration:.3f} s"),
@@ -959,6 +1453,15 @@ def build_dashboard(data_dir, output_file):
         + '<section><h2>Node traces</h2><div class="node-links">'
         + "".join(node_links)
         + "</div></section>"
+        + '<section><h2>Cross-node start alignment</h2>'
+        + _figure_html(cross_node_alignment_figure(workers, spans), "cross-node-alignment")
+        + "</section>"
+        + '<section><h2>CPU, GPU, storage, and network activity</h2>'
+        + _figure_html(
+            resource_activity_figure(resource_spans),
+            "aggregate-resource-activity",
+        )
+        + "</section>"
         + '<section><h2>Cluster activity</h2>'
         + _figure_html(aggregate_activity_figure(spans), "cluster-activity")
         + "</section>"
@@ -971,6 +1474,12 @@ def build_dashboard(data_dir, output_file):
         + '<section><h2>Checkpoint performance</h2>'
         + _figure_html(checkpoint_figure(workers), "checkpoint-performance")
         + "</section>"
+        + '<section><h2>Simulator hardware profiles</h2><div class="table-wrap"><table>'
+        + "<thead><tr>"
+        + HARDWARE_TABLE_HEADER
+        + "</tr></thead><tbody>"
+        + _hardware_table(workers)
+        + "</tbody></table></div></section>"
         + '<section><h2>GPU and host telemetry</h2>'
         + _figure_html(system_metrics_figure(workers), "aggregate-system-metrics")
         + "</section>"
@@ -987,7 +1496,8 @@ def build_dashboard(data_dir, output_file):
         )
         + "</section>"
         + '<section><h2>Slow-span explorer</h2><div class="table-wrap"><table><thead><tr>'
-        + "<th>Start</th><th>Duration</th><th>Worker</th><th>Category</th><th>Operation</th>"
+        + "<th>Start UTC</th><th>Offset</th><th>Duration</th><th>Worker</th>"
+        + "<th>Category</th><th>Operation</th>"
         + "<th>Step</th><th>Status</th></tr></thead><tbody>"
         + _slow_span_table(spans)
         + "</tbody></table></div></section>"
@@ -1013,7 +1523,11 @@ def visualization_files(source):
     collected = source / "collected"
     if not index.is_file() or not collected.is_dir():
         raise FileNotFoundError("Visualization is incomplete; run make visualize first")
-    generated = [source / "plotly.min.js", *sorted((source / "nodes").glob("*.html"))]
+    generated = [
+        source / "simulator-profile.json",
+        source / "plotly.min.js",
+        *sorted((source / "nodes").glob("*.html")),
+    ]
     traces = [path for path in sorted(collected.rglob("*")) if path.is_file()]
     return [index, *(path for path in generated if path.is_file()), *traces]
 

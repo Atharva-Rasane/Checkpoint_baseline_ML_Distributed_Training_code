@@ -14,6 +14,8 @@ from train import (
 )
 from visualization.trace_tools import (
     build_dashboard,
+    build_spans,
+    cross_node_alignment_figure,
     read_hosts,
     summarize_operator_trace,
     upload_visualization,
@@ -55,10 +57,38 @@ def test_deepspeed_config_is_not_passed_twice():
 
 
 def test_visualization_builds_from_rank_metrics(tmp_path):
+    base_ns = 1_785_267_720_000_000_000
     worker_dir = tmp_path / "collected" / "localhost" / "run-1" / "node" / "rank-0"
     worker_dir.mkdir(parents=True)
     events = [
-        {"event": "run_start", "model": "tiny_gpt", "rank": 0, "world_size": 1},
+        {
+            "event": "run_start",
+            "timestamp": "2026-07-28T19:42:00+00:00",
+            "model": "tiny_gpt",
+            "job": "tiny_gpt",
+            "rank": 0,
+            "world_size": 1,
+        },
+        {
+            "event": "hardware_profile",
+            "gpu_name": "Tesla T4",
+            "gpu_total_memory_bytes": 16 * 1024**3,
+            "cpu_model": "Test CPU",
+            "cpu_count": 4,
+            "host_memory_bytes": 32 * 1024**3,
+            "network_interface": "ens4",
+            "nic_link_speed_mbps": 16000,
+            "storage_write_gbps": 1.2,
+            "storage_read_gbps": 2.4,
+            "host_to_gpu_gbps": 11.0,
+            "gpu_to_host_gbps": 10.0,
+            "gpu_dram_copy_gbps": 250.0,
+            "all_reduce_payload_gbps": 8.0,
+            "all_reduce_bus_gbps": 8.0,
+            "all_reduce_average_ms": 2.0,
+            "model_parameter_bytes": 1024**3,
+            "gradient_bytes_estimate": 1024**3,
+        },
         {
             "event": "span",
             "host": "node",
@@ -66,8 +96,8 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "category": "Training",
             "operation": "Forward",
             "step": 1,
-            "start_ns": 1_000_000_000,
-            "end_ns": 1_005_000_000,
+            "start_ns": base_ns,
+            "end_ns": base_ns + 5_000_000,
             "duration_ms": 5,
         },
         {"event": "step", "step": 1, "loss": 2.5, "duration_ms": 10, "cuda_peak_allocated_bytes": 100},
@@ -76,7 +106,25 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     (worker_dir / "metrics.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
     )
-    (worker_dir / "operator-trace.json").write_text("{}", encoding="utf-8")
+    (worker_dir / "operator-trace.json").write_text(
+        json.dumps(
+            {
+                "baseTimeNanoseconds": base_ns,
+                "traceEvents": [
+                    {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 100, "dur": 80},
+                    {"ph": "X", "cat": "kernel", "name": "gemm", "ts": 200, "dur": 60},
+                    {
+                        "ph": "X",
+                        "cat": "kernel",
+                        "name": "ncclAllReduce",
+                        "ts": 300,
+                        "dur": 50,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     resource_events = [
         {
             "event": "resource_span",
@@ -86,8 +134,8 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "category": "Training",
             "operation": "Forward",
             "resource": resource,
-            "start_ns": 1_000_000_000,
-            "end_ns": 1_005_000_000,
+            "start_ns": base_ns,
+            "end_ns": base_ns + 5_000_000,
             "duration_ms": duration,
             "measurement": measurement,
         }
@@ -105,18 +153,30 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
 
     aggregate = output.read_text(encoding="utf-8")
     node_page = tmp_path / "nodes" / "node.html"
+    simulator_profile = json.loads((tmp_path / "simulator-profile.json").read_text())
 
     assert "Aggregate Trace Explorer" in aggregate
     assert "Cluster activity" in aggregate
+    assert "Cross-node start alignment" in aggregate
+    assert "CPU, GPU, storage, and network activity" in aggregate
     assert "Node trace: node" in aggregate
     assert "Top CPU operators" in aggregate
     assert '<script src="' not in aggregate
     assert node_page.is_file()
     node_html = node_page.read_text(encoding="utf-8")
     assert "Resource occupancy" in node_html
+    assert "CPU, GPU, and gradient synchronization timeline" in node_html
+    assert "Simulator hardware profile" in node_html
+    assert "16.00 Gbps" in node_html
+    assert "Absolute UTC time" in node_html
+    assert r"Gradient\u002fNCCL sync" in node_html
     assert r"tiny_gpt \u002f rank 0 \u002f CPU" in node_html
     assert r"tiny_gpt \u002f rank 0 \u002f GPU" in node_html
     assert "CPU/GPU log" in node_html
+    assert simulator_profile["trace_start_utc"].startswith("2026-07-28T19:42:00")
+    assert simulator_profile["nodes"]["node"]["ranks"][0]["hardware"][
+        "nic_link_speed_mbps"
+    ] == 16000
 
 
 def test_hostfile_parser_ignores_slots_and_comments(tmp_path):
@@ -126,15 +186,54 @@ def test_hostfile_parser_ignores_slots_and_comments(tmp_path):
     assert read_hosts(hostfile) == ["localhost", "10.0.0.2"]
 
 
+def test_cross_node_timeline_preserves_utc_start_offsets():
+    base_ns = 1_785_267_720_000_000_000
+    workers = []
+    for rank, offset_ms in ((0, 0), (1, 5)):
+        start_ns = base_ns + offset_ms * 1_000_000
+        workers.append(
+            {
+                "worker": f"node-{rank}/rank-{rank}",
+                "host": f"node-{rank}",
+                "started_at": f"2026-07-28T19:42:00.{offset_ms:03d}+00:00",
+                "events": [
+                    {
+                        "event": "span",
+                        "rank": rank,
+                        "category": "Training",
+                        "operation": "Forward",
+                        "start_ns": start_ns,
+                        "end_ns": start_ns + 2_000_000,
+                    }
+                ],
+            }
+        )
+
+    spans = build_spans(workers)
+    figure = cross_node_alignment_figure(workers, spans)
+
+    assert spans[1]["start_s"] == 0.005
+    assert figure.data[0].customdata[0][1] == 0
+    assert round(figure.data[0].customdata[1][1], 3) == 5
+    assert figure.layout.xaxis.type == "date"
+
+
 def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
     trace = tmp_path / "operator-trace.json"
     trace.write_text(
         json.dumps(
             {
+                "baseTimeNanoseconds": 1_000_000_000,
                 "traceEvents": [
-                    {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "dur": 100},
-                    {"ph": "X", "cat": "kernel", "name": "gemm", "dur": 80},
-                    {"ph": "X", "cat": "kernel", "name": "ncclAllReduce", "dur": 20},
+                    {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 10, "dur": 100},
+                    {"ph": "X", "cat": "kernel", "name": "gemm", "ts": 20, "dur": 80},
+                    {
+                        "ph": "X",
+                        "cat": "kernel",
+                        "name": "ncclAllReduce",
+                        "ts": 30,
+                        "dur": 20,
+                    },
                 ]
             }
         ),
@@ -146,6 +245,12 @@ def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
     assert summary["counts"] == {"cpu": 1, "gpu": 2, "communication": 1}
     assert summary["cpu"]["aten::mm"] == 100
     assert summary["communication"]["ncclAllReduce"] == 20
+    assert summary["timeline_events"][0]["start_ns"] == 1_000_010_000
+    assert {event["resource"] for event in summary["timeline_events"]} == {
+        "CPU",
+        "GPU",
+        "Communication",
+    }
 
 
 def test_checkpoint_directory_stats(tmp_path):

@@ -9,5 +9,6 @@ visualization/collected/
 visualization/nodes/
 visualization/index.html
 visualization/plotly.min.js
+visualization/simulator-profile.json
 hostfile
 *.log

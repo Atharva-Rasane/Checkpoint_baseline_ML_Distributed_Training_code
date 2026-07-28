@@ -2,6 +2,7 @@ import argparse
 import importlib
 import json
 import os
+import platform
 import resource
 import socket
 import time
@@ -215,6 +216,164 @@ def directory_stats(path):
         return 0, 0
 
 
+def _default_network_interface():
+    try:
+        for line in Path("/proc/net/route").read_text(encoding="utf-8").splitlines()[1:]:
+            fields = line.split()
+            if len(fields) > 1 and fields[1] == "00000000":
+                return fields[0]
+    except OSError:
+        return None
+    return None
+
+
+def _cpu_model():
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
+def _storage_benchmark(directory, size_mb, host):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f".trace-storage-benchmark-{host}"
+    total_bytes = max(1, size_mb) * 1024**2
+    block = bytes(min(4 * 1024**2, total_bytes))
+    try:
+        started = time.perf_counter()
+        with path.open("wb", buffering=0) as output:
+            remaining = total_bytes
+            while remaining:
+                chunk = block[: min(len(block), remaining)]
+                output.write(chunk)
+                remaining -= len(chunk)
+            os.fsync(output.fileno())
+        write_seconds = time.perf_counter() - started
+
+        started = time.perf_counter()
+        with path.open("rb", buffering=0) as source:
+            while source.read(len(block)):
+                pass
+        read_seconds = time.perf_counter() - started
+        return {
+            "storage_benchmark_bytes": total_bytes,
+            "storage_write_gbps": total_bytes / max(write_seconds, 1e-9) / 1e9,
+            "storage_read_gbps": total_bytes / max(read_seconds, 1e-9) / 1e9,
+        }
+    except OSError as exc:
+        return {"storage_benchmark_error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _gpu_bandwidth_benchmark(device, size_mb):
+    total_bytes = max(1, size_mb) * 1024**2
+    elements = total_bytes // 4
+    iterations = 3
+    host_source = torch.empty(elements, dtype=torch.float32, pin_memory=True)
+    host_destination = torch.empty_like(host_source, pin_memory=True)
+    device_source = torch.empty(elements, dtype=torch.float32, device=device)
+    device_destination = torch.empty_like(device_source)
+
+    def measure(operation):
+        torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        for _ in range(iterations):
+            operation()
+        torch.cuda.synchronize(device)
+        return total_bytes * iterations / max(time.perf_counter() - started, 1e-9) / 1e9
+
+    values = {
+        "host_to_gpu_gbps": measure(
+            lambda: device_source.copy_(host_source, non_blocking=True)
+        ),
+        "gpu_to_host_gbps": measure(
+            lambda: host_destination.copy_(device_source, non_blocking=True)
+        ),
+        "gpu_dram_copy_gbps": measure(lambda: device_destination.copy_(device_source)),
+        "gpu_bandwidth_benchmark_bytes": total_bytes,
+    }
+    return values
+
+
+def distributed_bandwidth_benchmark(device, size_mb):
+    world_size = torch.distributed.get_world_size()
+    if world_size <= 1:
+        return {}
+    total_bytes = max(1, size_mb) * 1024**2
+    tensor = torch.ones(total_bytes // 4, dtype=torch.float32, device=device)
+    iterations = 3
+    torch.distributed.all_reduce(tensor)
+    torch.cuda.synchronize(device)
+    torch.distributed.barrier()
+    started = time.perf_counter()
+    for _ in range(iterations):
+        torch.distributed.all_reduce(tensor)
+    torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    average_seconds = elapsed / iterations
+    payload_gbps = total_bytes / max(average_seconds, 1e-9) / 1e9
+    return {
+        "all_reduce_benchmark_bytes": total_bytes,
+        "all_reduce_average_ms": average_seconds * 1000,
+        "all_reduce_payload_gbps": payload_gbps,
+        "all_reduce_bus_gbps": payload_gbps * 2 * (world_size - 1) / world_size,
+    }
+
+
+def hardware_profile(device, storage_dir, benchmark_mb, run_benchmarks):
+    host = socket.gethostname().split(".")[0]
+    interface = _default_network_interface()
+    Path(storage_dir).mkdir(parents=True, exist_ok=True)
+    storage = os.statvfs(storage_dir)
+    memory_kib = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                memory_kib = int(line.split()[1])
+                break
+    except OSError:
+        pass
+
+    properties = torch.cuda.get_device_properties(device)
+    values = {
+        "cpu_count": os.cpu_count(),
+        "cpu_model": _cpu_model(),
+        "host_memory_bytes": memory_kib * 1024,
+        "network_interface": interface,
+        "storage_path": str(Path(storage_dir).resolve()),
+        "storage_capacity_bytes": storage.f_blocks * storage.f_frsize,
+        "storage_free_bytes": storage.f_bavail * storage.f_frsize,
+        "gpu_name": properties.name,
+        "gpu_total_memory_bytes": properties.total_memory,
+        "gpu_compute_capability": f"{properties.major}.{properties.minor}",
+        "gpu_multiprocessor_count": properties.multi_processor_count,
+    }
+    if interface:
+        try:
+            link_speed = int(
+                Path(f"/sys/class/net/{interface}/speed").read_text(encoding="utf-8").strip()
+            )
+            if link_speed > 0:
+                values["nic_link_speed_mbps"] = link_speed
+        except (OSError, ValueError):
+            pass
+
+    memory_clock_khz = getattr(properties, "memory_clock_rate", None)
+    memory_bus_bits = getattr(properties, "memory_bus_width", None)
+    if memory_clock_khz and memory_bus_bits:
+        values["gpu_dram_theoretical_gbps"] = (
+            memory_clock_khz * 1000 * (memory_bus_bits / 8) * 2 / 1e9
+        )
+    if run_benchmarks:
+        values.update(_storage_benchmark(Path(storage_dir), benchmark_mb, host))
+        values.update(_gpu_bandwidth_benchmark(device, benchmark_mb))
+    return values
+
+
 def load_model(model_name, **kwargs):
     module_path = f"llm_models.{model_name}"
     try:
@@ -242,6 +401,7 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--vocab_size", type=int, default=50304)
     parser.add_argument("--dataset_samples", type=int, default=10000)
+    parser.add_argument("--hardware_benchmark_mb", type=int, default=64)
     parser.add_argument("--trace", action="store_true", help="Collect full per-rank CPU/CUDA traces")
     parser.add_argument("--trace_dir", default="visualization/traces")
     parser.add_argument("--run_id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
@@ -290,8 +450,43 @@ def main():
     try:
         with trace.span("Setup", "Model and DeepSpeed initialization"):
             model = load_model(args.model_name, vocab_size=args.vocab_size, seq_len=args.seq_len)
+            parameter_count = sum(parameter.numel() for parameter in model.parameters())
+            trainable_parameter_count = sum(
+                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            )
+            parameter_bytes = sum(
+                parameter.numel() * parameter.element_size() for parameter in model.parameters()
+            )
             dataset = RandomTokenDataset(args.dataset_samples, args.seq_len, args.vocab_size)
             engine, _, _, _ = initialize_engine(deepspeed, args, model, dataset)
+
+            if args.trace:
+                torch.distributed.barrier()
+                profile = hardware_profile(
+                    engine.device,
+                    args.output_dir,
+                    args.hardware_benchmark_mb,
+                    run_benchmarks=args.local_rank == 0,
+                )
+                profile.update(
+                    distributed_bandwidth_benchmark(
+                        engine.device,
+                        args.hardware_benchmark_mb,
+                    )
+                )
+                trace.log(
+                    "hardware_profile",
+                    local_rank=args.local_rank,
+                    model_parameter_count=parameter_count,
+                    model_trainable_parameter_count=trainable_parameter_count,
+                    model_parameter_bytes=parameter_bytes,
+                    gradient_bytes_estimate=parameter_bytes,
+                    sequence_length=args.seq_len,
+                    vocabulary_size=args.vocab_size,
+                    dataset_samples=args.dataset_samples,
+                    **profile,
+                )
+                torch.distributed.barrier()
 
         engine.train()
         data_iter = iter(engine.training_dataloader)
