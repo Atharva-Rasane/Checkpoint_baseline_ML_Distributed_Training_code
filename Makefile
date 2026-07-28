@@ -21,7 +21,7 @@ REMOTE_DIR ?= $(CURDIR)
 SERVE_HOST ?= 127.0.0.1
 PORT ?= 8000
 BUCKET ?= gbc-oit-rc-basil-app-bo-training-traces
-UPLOAD_PREFIX ?= $(shell hostname)_$(shell date -u +%Y%m%d_%H%M%S)
+UPLOAD_PREFIX ?= $(shell hostname -s)_$(shell date -u +%Y%m%d_%H%M%S)
 
 setup:
 	python3 -m venv $(VENV)

@@ -121,7 +121,14 @@ def upload_visualization(source, bucket_name, prefix, client=None):
     for path in files:
         object_name = f"{prefix.strip('/')}/{path.relative_to(source).as_posix()}"
         content_type, _ = mimetypes.guess_type(path.name)
-        bucket.blob(object_name).upload_from_filename(path, content_type=content_type)
+        try:
+            bucket.blob(object_name).upload_from_filename(path, content_type=content_type)
+        except Exception as exc:
+            if getattr(exc, "code", None) == 403:
+                raise SystemExit(
+                    "GCS upload denied (403). Verify bucket IAM and set the GCE VM OAuth scope to cloud-platform."
+                ) from exc
+            raise
         print(f"Uploaded gs://{bucket_name}/{object_name}")
     print(f"Uploaded {len(files)} file(s) to gs://{bucket_name}/{prefix.strip('/')}/")
 
