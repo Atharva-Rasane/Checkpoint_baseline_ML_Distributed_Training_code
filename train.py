@@ -84,26 +84,38 @@ class TrainingTrace:
                 cuda_end.record()
                 self.cuda_span_events[span_id] = (cuda_start, cuda_end)
             end_ns = time.time_ns()
-            self.span_metadata[span_id] = {
-                "category": category,
-                "operation": operation,
-                "start_ns": start_ns,
-                "end_ns": end_ns,
-                "status": "error" if error else "ok",
-                **values,
-            }
-            self.log(
-                "span",
+            self.record_span(
+                category,
+                operation,
+                start_ns,
+                end_ns,
                 span_id=span_id,
-                category=category,
-                operation=operation,
-                start_ns=start_ns,
-                end_ns=end_ns,
-                duration_ms=(end_ns - start_ns) / 1_000_000,
                 status="error" if error else "ok",
                 error=error,
                 **values,
             )
+
+    def record_span(self, category, operation, start_ns, end_ns, span_id=None, **values):
+        if not self.enabled:
+            return
+        if span_id is None:
+            span_id = self.next_span_id
+            self.next_span_id += 1
+        metadata = {
+            "category": category,
+            "operation": operation,
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+            "status": values.pop("status", "ok"),
+            **values,
+        }
+        self.span_metadata[span_id] = metadata
+        self.log(
+            "span",
+            span_id=span_id,
+            duration_ms=(end_ns - start_ns) / 1_000_000,
+            **metadata,
+        )
 
     def log(self, event, **values):
         if not self.enabled:
@@ -188,7 +200,9 @@ class TrainingTrace:
                         if profiler_span is not None
                         else None
                     ),
-                    "measurement": "phase_wall_clock",
+                    "measurement": metadata.get(
+                        "resource_measurement", "phase_wall_clock"
+                    ),
                     "start_alignment": "observed_wall_clock",
                     "start_is_estimated": False,
                 }
@@ -464,19 +478,147 @@ def parse_args():
     return parser.parse_args()
 
 
-def initialize_engine(deepspeed, args, model, dataset):
-    return deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=model.parameters(),
-        training_data=dataset,
+def checkpoint_deepspeed_config(checkpoint_mode):
+    if checkpoint_mode == "synchronous":
+        return None
+    if checkpoint_mode != "asynchronous":
+        raise ValueError(f"Unsupported checkpoint mode: {checkpoint_mode}")
+    config_path = Path(__file__).with_name("ds_config_zero3.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["checkpoint"] = {
+        "tag_validation": "WARN",
+        "checkpoint_serialization": True,
+        "writer": {
+            "type": "PYTHON",
+            "decoupled": True,
+            "data_parallel": "REPLICA",
+            "show_statistics": True,
+        },
+    }
+    return config
+
+
+def initialize_engine(deepspeed, args, model, dataset, config=None):
+    initialize_args = {
+        "args": args,
+        "model": model,
+        "model_parameters": model.parameters(),
+        "training_data": dataset,
+    }
+    if config is not None:
+        initialize_args["config"] = config
+    return deepspeed.initialize(**initialize_args)
+
+
+def finish_async_checkpoint(engine, trace, pending, output_dir, rank, force=False):
+    if pending is None:
+        return None
+    commit_info = engine.checkpoint_engine.get_commit_info()
+    if commit_info is not None and not force:
+        return pending
+    if commit_info is not None:
+        wait_start_ns = time.time_ns()
+        engine._commit_decoupled_checkpoint()
+        wait_end_ns = time.time_ns()
+        trace.record_span(
+            "Checkpoint",
+            "Async checkpoint commit wait",
+            wait_start_ns,
+            wait_end_ns,
+            step=pending["step"],
+            tag=pending["tag"],
+            checkpoint_mode="asynchronous",
+            checkpoint_worker_pid=pending["worker_pid"],
+            resource_measurement="checkpoint_commit_wait_wall_clock",
+        )
+
+    completed_ns = time.time_ns()
+    persistence_start_ns = pending["staged_ns"]
+    trace.record_span(
+        "Checkpoint",
+        "Async checkpoint persistence",
+        persistence_start_ns,
+        completed_ns,
+        step=pending["step"],
+        tag=pending["tag"],
+        checkpoint_mode="asynchronous",
+        checkpoint_worker_pid=pending["worker_pid"],
+        resource_measurement="background_checkpoint_process_wall_clock",
     )
+    total_duration_ms = (completed_ns - pending["request_ns"]) / 1_000_000
+    persistence_duration_ms = (completed_ns - persistence_start_ns) / 1_000_000
+    checkpoint_files, checkpoint_bytes = (
+        directory_stats(Path(output_dir) / pending["tag"]) if rank == 0 else (0, 0)
+    )
+    trace.log(
+        "checkpoint_complete",
+        step=pending["step"],
+        tag=pending["tag"],
+        output_dir=output_dir,
+        checkpoint_mode="asynchronous",
+        checkpoint_worker_pid=pending["worker_pid"],
+        duration_ms=total_duration_ms,
+        staging_duration_ms=pending["staging_duration_ms"],
+        persistence_duration_ms=persistence_duration_ms,
+        checkpoint_file_count=checkpoint_files,
+        checkpoint_size_bytes=checkpoint_bytes,
+        checkpoint_throughput_mib_s=(
+            checkpoint_bytes / 1024**2 / (persistence_duration_ms / 1000)
+            if persistence_duration_ms > 0
+            else 0
+        ),
+    )
+    return None
 
 
-def main():
+def start_async_checkpoint(engine, trace, step, output_dir):
+    tag = f"step-{step}"
+    request_ns = time.time_ns()
+    trace.log(
+        "checkpoint_start",
+        step=step,
+        tag=tag,
+        output_dir=output_dir,
+        checkpoint_mode="asynchronous",
+    )
+    with trace.span(
+        "Checkpoint",
+        "Async checkpoint staging",
+        step=step,
+        tag=tag,
+        checkpoint_mode="asynchronous",
+    ):
+        engine.save_checkpoint(output_dir, tag=tag)
+    staged_ns = time.time_ns()
+    process = getattr(engine.checkpoint_engine, "ckpt_process", None)
+    worker_pid = getattr(process, "pid", None)
+    staging_duration_ms = (staged_ns - request_ns) / 1_000_000
+    trace.log(
+        "checkpoint_queued",
+        step=step,
+        tag=tag,
+        output_dir=output_dir,
+        checkpoint_mode="asynchronous",
+        checkpoint_worker_pid=worker_pid,
+        staging_duration_ms=staging_duration_ms,
+    )
+    return {
+        "step": step,
+        "tag": tag,
+        "request_ns": request_ns,
+        "staged_ns": staged_ns,
+        "staging_duration_ms": staging_duration_ms,
+        "worker_pid": worker_pid,
+    }
+
+
+def main(checkpoint_mode="synchronous"):
     import deepspeed
 
     args = parse_args()
+    deepspeed_config = checkpoint_deepspeed_config(checkpoint_mode)
+    if deepspeed_config is not None:
+        args.deepspeed_config = None
     deepspeed.init_distributed()
 
     rank = torch.distributed.get_rank()
@@ -494,6 +636,7 @@ def main():
             "model": args.model_name,
             "steps": args.steps,
             "save_every": args.save_every,
+            "checkpoint_mode": checkpoint_mode,
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda,
         },
@@ -511,7 +654,15 @@ def main():
                 parameter.numel() * parameter.element_size() for parameter in model.parameters()
             )
             dataset = RandomTokenDataset(args.dataset_samples, args.seq_len, args.vocab_size)
-            engine, _, _, _ = initialize_engine(deepspeed, args, model, dataset)
+            engine, _, _, _ = initialize_engine(
+                deepspeed,
+                args,
+                model,
+                dataset,
+                config=deepspeed_config,
+            )
+            if checkpoint_mode == "asynchronous" and not engine.checkpoint_engine.is_decoupled():
+                raise RuntimeError("DeepSpeed did not initialize its decoupled checkpoint engine")
 
             if args.trace:
                 torch.distributed.barrier()
@@ -543,6 +694,7 @@ def main():
 
         engine.train()
         data_iter = iter(engine.training_dataloader)
+        pending_checkpoint = None
 
         for step in range(1, args.steps + 1):
             if args.trace:
@@ -564,6 +716,14 @@ def main():
                 engine.backward(loss)
             with trace.span("Optimizer", "Optimizer step", step=step):
                 engine.step()
+            if checkpoint_mode == "asynchronous":
+                pending_checkpoint = finish_async_checkpoint(
+                    engine,
+                    trace,
+                    pending_checkpoint,
+                    args.output_dir,
+                    rank,
+                )
 
             if args.trace:
                 torch.cuda.synchronize(engine.device)
@@ -585,29 +745,73 @@ def main():
                 print(f"step={step} loss={loss.item():.4f}")
 
             if step % args.save_every == 0:
-                checkpoint_started = time.perf_counter()
-                tag = f"step-{step}"
-                trace.log("checkpoint_start", step=step, tag=tag, output_dir=args.output_dir)
-                with trace.span("Checkpoint", "Save checkpoint", step=step, tag=tag):
-                    engine.save_checkpoint(args.output_dir, tag=tag)
-                checkpoint_duration_ms = (time.perf_counter() - checkpoint_started) * 1000
-                checkpoint_files, checkpoint_bytes = (
-                    directory_stats(Path(args.output_dir) / tag) if rank == 0 else (0, 0)
-                )
-                trace.log(
-                    "checkpoint_complete",
-                    step=step,
-                    tag=tag,
-                    output_dir=args.output_dir,
-                    duration_ms=checkpoint_duration_ms,
-                    checkpoint_file_count=checkpoint_files,
-                    checkpoint_size_bytes=checkpoint_bytes,
-                    checkpoint_throughput_mib_s=(
-                        checkpoint_bytes / 1024**2 / (checkpoint_duration_ms / 1000)
-                        if checkpoint_duration_ms > 0
-                        else 0
-                    ),
-                )
+                if checkpoint_mode == "asynchronous":
+                    pending_checkpoint = finish_async_checkpoint(
+                        engine,
+                        trace,
+                        pending_checkpoint,
+                        args.output_dir,
+                        rank,
+                        force=True,
+                    )
+                    pending_checkpoint = start_async_checkpoint(
+                        engine,
+                        trace,
+                        step,
+                        args.output_dir,
+                    )
+                else:
+                    checkpoint_started = time.perf_counter()
+                    tag = f"step-{step}"
+                    trace.log(
+                        "checkpoint_start",
+                        step=step,
+                        tag=tag,
+                        output_dir=args.output_dir,
+                        checkpoint_mode="synchronous",
+                    )
+                    with trace.span(
+                        "Checkpoint",
+                        "Save checkpoint",
+                        step=step,
+                        tag=tag,
+                        checkpoint_mode="synchronous",
+                    ):
+                        engine.save_checkpoint(args.output_dir, tag=tag)
+                    checkpoint_duration_ms = (
+                        time.perf_counter() - checkpoint_started
+                    ) * 1000
+                    checkpoint_files, checkpoint_bytes = (
+                        directory_stats(Path(args.output_dir) / tag)
+                        if rank == 0
+                        else (0, 0)
+                    )
+                    trace.log(
+                        "checkpoint_complete",
+                        step=step,
+                        tag=tag,
+                        output_dir=args.output_dir,
+                        checkpoint_mode="synchronous",
+                        duration_ms=checkpoint_duration_ms,
+                        checkpoint_file_count=checkpoint_files,
+                        checkpoint_size_bytes=checkpoint_bytes,
+                        checkpoint_throughput_mib_s=(
+                            checkpoint_bytes / 1024**2 / (checkpoint_duration_ms / 1000)
+                            if checkpoint_duration_ms > 0
+                            else 0
+                        ),
+                    )
+
+        if checkpoint_mode == "asynchronous":
+            finish_async_checkpoint(
+                engine,
+                trace,
+                pending_checkpoint,
+                args.output_dir,
+                rank,
+                force=True,
+            )
+            engine.checkpoint_engine.cleanup()
 
         if rank == 0:
             print("done")

@@ -1,4 +1,4 @@
-.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode collect visualize serve upload test lint check clean
+.PHONY: setup install cuda-check doctor hostfile-local train train-hostfile-local train-multinode train-async train-async-hostfile-local train-async-multinode collect visualize serve upload test lint check clean
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
@@ -9,8 +9,10 @@ GPUS ?= 1
 HOSTFILE ?= hostfile
 MODEL ?= tiny_gpt
 JOB ?= $(MODEL)
+ASYNC_JOB ?= $(MODEL)-async
 STEPS ?= 100
 SAVE_EVERY ?= 100
+ASYNC_OUTPUT_DIR ?= checkpoints/asynchronous
 BENCHMARK_MB ?= 64
 MASTER_ADDR ?= localhost
 TRACE ?= 0
@@ -18,6 +20,9 @@ TRACE_DIR ?= visualization/traces
 RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 TRACE_ARGS = $(if $(filter 1 true yes,$(TRACE)),--trace --trace_dir $(TRACE_DIR) --run_id $(RUN_ID),)
 TRAIN_ARGS = --model_name $(MODEL) --job_name $(JOB) --steps $(STEPS) --save_every $(SAVE_EVERY) --hardware_benchmark_mb $(BENCHMARK_MB) $(TRACE_ARGS)
+ASYNC_TRAIN_ARGS = --model_name $(MODEL) --job_name $(ASYNC_JOB) --output_dir $(ASYNC_OUTPUT_DIR) --steps $(STEPS) --save_every $(SAVE_EVERY) --hardware_benchmark_mb $(BENCHMARK_MB) $(TRACE_ARGS)
+SYNC_TRAIN = checkpointing/synchronous/train.py
+ASYNC_TRAIN = checkpointing/asynchronous/train.py
 VIS_DIR ?= visualization
 REMOTE_DIR ?= $(CURDIR)
 SERVE_HOST ?= 127.0.0.1
@@ -49,13 +54,22 @@ hostfile-local:
 	cat $(HOSTFILE)
 
 train: cuda-check
-	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) train.py $(TRAIN_ARGS)
+	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) $(SYNC_TRAIN) $(TRAIN_ARGS)
 
 train-hostfile-local: cuda-check hostfile-local
-	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) train.py $(TRAIN_ARGS)
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) $(SYNC_TRAIN) $(TRAIN_ARGS)
 
 train-multinode: cuda-check
-	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) train.py $(TRAIN_ARGS)
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) $(SYNC_TRAIN) $(TRAIN_ARGS)
+
+train-async: cuda-check
+	$(CUDA_ENV) $(DEEPSPEED) --num_gpus $(GPUS) $(ASYNC_TRAIN) $(ASYNC_TRAIN_ARGS)
+
+train-async-hostfile-local: cuda-check hostfile-local
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --no_ssh --node_rank 0 --num_nodes 1 --master_addr $(MASTER_ADDR) $(ASYNC_TRAIN) $(ASYNC_TRAIN_ARGS)
+
+train-async-multinode: cuda-check
+	$(CUDA_ENV) $(DEEPSPEED) --hostfile $(HOSTFILE) --master_addr $(MASTER_ADDR) $(ASYNC_TRAIN) $(ASYNC_TRAIN_ARGS)
 
 collect:
 	$(PYTHON) $(VIS_DIR)/trace_tools.py collect --hostfile $(HOSTFILE) --source $(TRACE_DIR) --output $(VIS_DIR)/collected --remote-dir $(REMOTE_DIR)

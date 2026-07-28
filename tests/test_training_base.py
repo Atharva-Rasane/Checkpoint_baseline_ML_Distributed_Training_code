@@ -8,7 +8,9 @@ from torch.utils.data import Dataset
 from train import (
     RandomTokenDataset,
     TrainingTrace,
+    checkpoint_deepspeed_config,
     directory_stats,
+    finish_async_checkpoint,
     initialize_engine,
     load_model,
 )
@@ -57,6 +59,87 @@ def test_deepspeed_config_is_not_passed_twice():
     assert result == "engine"
 
 
+def test_async_checkpoint_config_uses_decoupled_cpu_writer():
+    config = checkpoint_deepspeed_config("asynchronous")
+
+    assert config["zero_optimization"]["stage"] == 3
+    assert config["checkpoint"]["writer"] == {
+        "type": "PYTHON",
+        "decoupled": True,
+        "data_parallel": "REPLICA",
+        "show_statistics": True,
+    }
+
+
+def test_async_checkpoint_completion_records_background_cpu_span(tmp_path, monkeypatch):
+    class FakeCheckpointEngine:
+        def __init__(self):
+            self.commit_info = object()
+
+        def get_commit_info(self):
+            return self.commit_info
+
+    class FakeEngine:
+        def __init__(self):
+            self.checkpoint_engine = FakeCheckpointEngine()
+            self.commits = 0
+
+        def _commit_decoupled_checkpoint(self):
+            self.commits += 1
+            self.checkpoint_engine.commit_info = None
+
+    class FakeTrace:
+        def __init__(self):
+            self.spans = []
+            self.events = []
+
+        def record_span(self, category, operation, start_ns, end_ns, **values):
+            self.spans.append((category, operation, start_ns, end_ns, values))
+
+        def log(self, event, **values):
+            self.events.append((event, values))
+
+    checkpoint_dir = tmp_path / "step-2"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "rank-0.pt").write_bytes(b"checkpoint")
+    timestamps = iter((200, 300, 400))
+    monkeypatch.setattr("train.time.time_ns", lambda: next(timestamps))
+    engine = FakeEngine()
+    trace = FakeTrace()
+    pending = {
+        "step": 2,
+        "tag": "step-2",
+        "request_ns": 100,
+        "staged_ns": 150,
+        "staging_duration_ms": 0.00005,
+        "worker_pid": 4321,
+    }
+
+    result = finish_async_checkpoint(
+        engine,
+        trace,
+        pending,
+        tmp_path,
+        rank=0,
+        force=True,
+    )
+
+    assert result is None
+    assert engine.commits == 1
+    assert [span[1] for span in trace.spans] == [
+        "Async checkpoint commit wait",
+        "Async checkpoint persistence",
+    ]
+    persistence = trace.spans[1]
+    assert persistence[2:4] == (150, 400)
+    assert persistence[4]["resource_measurement"] == (
+        "background_checkpoint_process_wall_clock"
+    )
+    assert trace.events[0][0] == "checkpoint_complete"
+    assert trace.events[0][1]["checkpoint_mode"] == "asynchronous"
+    assert trace.events[0][1]["checkpoint_worker_pid"] == 4321
+
+
 def test_visualization_builds_from_rank_metrics(tmp_path):
     base_ns = 1_785_267_720_000_000_000
     worker_dir = tmp_path / "collected" / "localhost" / "run-1" / "node" / "rank-0"
@@ -67,6 +150,7 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "timestamp": "2026-07-28T19:42:00+00:00",
             "model": "tiny_gpt",
             "job": "tiny_gpt",
+            "checkpoint_mode": "asynchronous",
             "rank": 0,
             "world_size": 1,
         },
@@ -135,6 +219,10 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "step": 1,
             "tag": "step-1",
             "duration_ms": 4,
+            "staging_duration_ms": 1,
+            "persistence_duration_ms": 3,
+            "checkpoint_mode": "asynchronous",
+            "checkpoint_worker_pid": 4321,
             "output_dir": "checkpoints",
         },
     ]
@@ -205,6 +293,27 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             ("GPU", "cuda_event_elapsed"),
         )
     ]
+    resource_events.append(
+        {
+            "schema_version": 2,
+            "event": "resource_span",
+            "host": "node",
+            "job": "tiny_gpt",
+            "rank": 0,
+            "category": "Checkpoint",
+            "operation": "Async checkpoint persistence",
+            "resource": "CPU",
+            "start_ns": base_ns + 2_000_000,
+            "end_ns": base_ns + 14_000_000,
+            "resource_start_ns": base_ns + 2_000_000,
+            "resource_end_ns": base_ns + 14_000_000,
+            "duration_ms": 12,
+            "measurement": "background_checkpoint_process_wall_clock",
+            "start_alignment": "observed_wall_clock",
+            "start_is_estimated": False,
+            "checkpoint_worker_pid": 4321,
+        }
+    )
     (worker_dir / "resource-trace.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in resource_events), encoding="utf-8"
     )
@@ -227,6 +336,10 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert "Backward - GPU" in aggregate
     assert "Optimizer step - CPU" in aggregate
     assert "Optimizer step - GPU" in aggregate
+    assert "Async checkpoint persistence - CPU" in aggregate
+    assert "background_checkpoint_process_wall_clock" in aggregate
+    assert "asynchronous" in aggregate
+    assert "4321" in aggregate
     assert "What happened?" in aggregate
     assert "Aggregate metrics" in aggregate
     assert "Collective communication occupancy" in aggregate
@@ -252,6 +365,9 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert r"tiny_gpt \u002f rank 0 \u002f collective stream" in node_html
     assert "CPU/GPU log" in node_html
     assert simulator_profile["trace_start_utc"].startswith("2026-07-28T19:42:00")
+    assert simulator_profile["checkpoint_mode"] == "asynchronous"
+    assert simulator_profile["checkpoints"][0]["staging_duration_ms"] == 1
+    assert simulator_profile["checkpoints"][0]["persistence_duration_ms"] == 3
     assert (
         simulator_profile["nodes"]["node"]["ranks"][0]["hardware"][
             "nic_link_speed_mbps"

@@ -38,6 +38,9 @@ OPERATION_COLORS = {
     "Backward": "#d55e00",
     "Optimizer step": "#009e73",
     "Save checkpoint": "#cc79a7",
+    "Async checkpoint staging": "#b45309",
+    "Async checkpoint persistence": "#7c3aed",
+    "Async checkpoint commit wait": "#dc2626",
     "Full step": "#2563eb",
 }
 RESOURCE_PATTERNS = {
@@ -277,6 +280,7 @@ def load_workers(data_dir):
                 "host": host,
                 "model": start.get("model", "unknown"),
                 "job": start.get("job", start.get("model", "training")),
+                "checkpoint_mode": start.get("checkpoint_mode", "synchronous"),
                 "rank": int(start.get("rank", worker_dir.name.removeprefix("rank-"))),
                 "world_size": start.get("world_size", "?"),
                 "run_id": run_id,
@@ -594,6 +598,7 @@ def resource_timeline(spans, host):
                         row.get("start_alignment", "legacy_phase_start"),
                         "yes" if row.get("start_is_estimated") else "no",
                         _resource_measurement_summary(row),
+                        row.get("checkpoint_worker_pid", "-"),
                     ]
                     for row in rows
                 ],
@@ -606,7 +611,8 @@ def resource_timeline(spans, host):
                     "<br>measurement=%{customdata[6]}"
                     "<br>start alignment=%{customdata[9]}"
                     "<br>estimated start=%{customdata[10]}"
-                    "<br>timing detail=%{customdata[11]}<extra></extra>"
+                    "<br>timing detail=%{customdata[11]}"
+                    "<br>checkpoint process PID=%{customdata[12]}<extra></extra>"
                 ),
             )
         )
@@ -1244,13 +1250,19 @@ def checkpoint_figure(workers):
                             row.get("output_dir", ""),
                             float(row.get("checkpoint_size_bytes") or 0) / 1024**3,
                             float(row.get("checkpoint_throughput_mib_s") or 0),
+                            row.get("checkpoint_mode", "synchronous"),
+                            row.get("staging_duration_ms"),
+                            row.get("persistence_duration_ms"),
                         ]
                         for row in rows
                     ],
                     hovertemplate=(
                         "step=%{x}<br>duration=%{y:.3f}ms<br>tag=%{customdata[0]}"
                         "<br>directory=%{customdata[1]}<br>size=%{customdata[2]:.3f}GiB"
-                        "<br>throughput=%{customdata[3]:.2f}MiB/s<extra>%{fullData.name}</extra>"
+                        "<br>throughput=%{customdata[3]:.2f}MiB/s"
+                        "<br>mode=%{customdata[4]}<br>staging=%{customdata[5]}ms"
+                        "<br>background persistence=%{customdata[6]}ms"
+                        "<extra>%{fullData.name}</extra>"
                     ),
                 )
             )
@@ -1297,6 +1309,7 @@ def write_simulator_profile(path, run_id, workers, spans):
                 {
                     "rank": worker["rank"],
                     "job": worker["job"],
+                    "checkpoint_mode": worker["checkpoint_mode"],
                     "hardware": worker["hardware"],
                 }
                 for worker in sorted(host_workers, key=lambda item: item["rank"])
@@ -1310,6 +1323,12 @@ def write_simulator_profile(path, run_id, workers, spans):
             "size_bytes": checkpoint.get("checkpoint_size_bytes", 0),
             "file_count": checkpoint.get("checkpoint_file_count", 0),
             "throughput_mib_s": checkpoint.get("checkpoint_throughput_mib_s", 0),
+            "checkpoint_mode": checkpoint.get(
+                "checkpoint_mode", worker["checkpoint_mode"]
+            ),
+            "staging_duration_ms": checkpoint.get("staging_duration_ms"),
+            "persistence_duration_ms": checkpoint.get("persistence_duration_ms"),
+            "checkpoint_worker_pid": checkpoint.get("checkpoint_worker_pid"),
         }
         for worker in workers
         for checkpoint in worker["checkpoints"]
@@ -1318,6 +1337,7 @@ def write_simulator_profile(path, run_id, workers, spans):
         "schema_version": 1,
         "run_id": run_id,
         "model": workers[0]["model"],
+        "checkpoint_mode": workers[0]["checkpoint_mode"],
         "world_size": len(workers),
         "trace_start_utc": min((span["start_utc"] for span in spans), default=None),
         "trace_duration_s": max((span["end_s"] for span in spans), default=0),
@@ -1547,12 +1567,17 @@ def _checkpoint_table(workers):
     rows = []
     for worker in workers:
         for checkpoint in worker["checkpoints"]:
+            staging_ms = checkpoint.get("staging_duration_ms")
+            persistence_ms = checkpoint.get("persistence_duration_ms")
             rows.append(
                 "<tr>"
                 f"<td>{html.escape(worker['worker'])}</td>"
                 f"<td>{checkpoint.get('step', '-')}</td>"
                 f"<td>{html.escape(str(checkpoint.get('tag', '-')))}</td>"
+                f"<td>{html.escape(str(checkpoint.get('checkpoint_mode', 'synchronous')))}</td>"
                 f"<td>{float(checkpoint.get('duration_ms') or 0):.3f} ms</td>"
+                f"<td>{f'{float(staging_ms):.3f} ms' if staging_ms is not None else '-'}</td>"
+                f"<td>{f'{float(persistence_ms):.3f} ms' if persistence_ms is not None else '-'}</td>"
                 f"<td>{float(checkpoint.get('checkpoint_size_bytes') or 0) / 1024**3:.3f} GiB</td>"
                 f"<td>{int(checkpoint.get('checkpoint_file_count') or 0)}</td>"
                 f"<td>{float(checkpoint.get('checkpoint_throughput_mib_s') or 0):.2f} MiB/s</td>"
@@ -1561,7 +1586,7 @@ def _checkpoint_table(workers):
             )
     return (
         "".join(rows)
-        or '<tr><td colspan="8" class="empty">No checkpoints recorded.</td></tr>'
+        or '<tr><td colspan="11" class="empty">No checkpoints recorded.</td></tr>'
     )
 
 
@@ -1838,7 +1863,8 @@ def node_body(
         + _worker_table(workers, page)
         + "</tbody></table></div></section>"
         + f'<section id="{prefix}-checkpoint-events"><h2>Checkpoint events</h2><div class="table-wrap"><table><thead><tr>'
-        + "<th>Worker</th><th>Step</th><th>Tag</th><th>Duration</th><th>Size</th>"
+        + "<th>Worker</th><th>Step</th><th>Tag</th><th>Mode</th><th>Total</th>"
+        + "<th>Staging</th><th>Background</th><th>Size</th>"
         + "<th>Files</th><th>Throughput</th><th>Directory</th>"
         + "</tr></thead><tbody>"
         + _checkpoint_table(workers)
@@ -2070,7 +2096,8 @@ def build_dashboard(data_dir, output_file):
         + '<section id="checkpointing"><h2>Checkpoint performance</h2>'
         + _figure_html(checkpoint_figure(workers), "checkpoint-performance")
         + '<div class="table-wrap"><table><thead><tr>'
-        + "<th>Worker</th><th>Step</th><th>Tag</th><th>Duration</th><th>Size</th>"
+        + "<th>Worker</th><th>Step</th><th>Tag</th><th>Mode</th><th>Total</th>"
+        + "<th>Staging</th><th>Background</th><th>Size</th>"
         + "<th>Files</th><th>Throughput</th><th>Directory</th>"
         + "</tr></thead><tbody>"
         + _checkpoint_table(workers)

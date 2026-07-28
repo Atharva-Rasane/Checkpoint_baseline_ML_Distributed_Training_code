@@ -149,6 +149,23 @@ make train-multinode HOSTFILE=hostfile MASTER_ADDR=10.128.0.12 MODEL=tiny_gpt ST
 
 Checkpoints are saved under `checkpoints/`.
 
+### Synchronous and asynchronous checkpointing
+
+The synchronous entry point is `checkpointing/synchronous/train.py`: every rank waits for `engine.save_checkpoint()` to finish before the next training iteration starts. The asynchronous entry point is `checkpointing/asynchronous/train.py`. Both use the shared root trainer so model loading and training behavior remain identical.
+
+The asynchronous entry point uses DeepSpeed's ZeRO-3-compatible decoupled checkpoint engine, which stages checkpoint state and persists it in a separate CPU process. Training can continue through data loading, forward, and backward while that process writes; DeepSpeed commits the checkpoint before the next parameter update, preserving a consistent snapshot.
+
+Run and trace the asynchronous version on one GPU:
+
+```bash
+make train-async-hostfile-local MODEL=tiny_gpt STEPS=16 SAVE_EVERY=2 TRACE=1
+make upload
+```
+
+Asynchronous checkpoints are written under `checkpoints/asynchronous/`. The trace shows `Async checkpoint staging`, `Async checkpoint persistence`, and any `Async checkpoint commit wait` on the CPU lane. Only one checkpoint is kept in flight because DeepSpeed exposes one pending commit at a time.
+
+The configured `gradient_accumulation_steps` is `8`. The training loop calls `engine.step()` after every forward/backward microbatch, but DeepSpeed applies a real optimizer parameter update only at each eighth microbatch. On one GPU the effective batch per update is `2 microbatch samples x 8 accumulation steps = 16 samples`; with multiple data-parallel GPUs it is also multiplied by the GPU count. This is why the detailed trace shows the substantive optimizer update every eight iterations.
+
 ## Full Distributed Traces
 
 Tracing is opt-in because collecting every CPU operation, CUDA kernel, tensor shape, stack, FLOP estimate, and memory event adds significant overhead and can produce large files.
