@@ -38,7 +38,7 @@ On the VM:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git make python3 python3-venv python3-pip build-essential libaio-dev
+sudo apt-get install -y git gh make python3 python3-venv python3-pip build-essential libaio-dev
 nvidia-smi
 ```
 
