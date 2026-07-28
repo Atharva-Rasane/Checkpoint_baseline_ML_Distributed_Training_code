@@ -100,8 +100,20 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "end_ns": base_ns + 5_000_000,
             "duration_ms": 5,
         },
-        {"event": "step", "step": 1, "loss": 2.5, "duration_ms": 10, "cuda_peak_allocated_bytes": 100},
-        {"event": "checkpoint_complete", "step": 1, "tag": "step-1", "duration_ms": 4, "output_dir": "checkpoints"},
+        {
+            "event": "step",
+            "step": 1,
+            "loss": 2.5,
+            "duration_ms": 10,
+            "cuda_peak_allocated_bytes": 100,
+        },
+        {
+            "event": "checkpoint_complete",
+            "step": 1,
+            "tag": "step-1",
+            "duration_ms": 4,
+            "output_dir": "checkpoints",
+        },
     ]
     (worker_dir / "metrics.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
@@ -111,7 +123,13 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             {
                 "baseTimeNanoseconds": base_ns,
                 "traceEvents": [
-                    {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 100, "dur": 80},
+                    {
+                        "ph": "X",
+                        "cat": "cpu_op",
+                        "name": "aten::mm",
+                        "ts": 100,
+                        "dur": 80,
+                    },
                     {"ph": "X", "cat": "kernel", "name": "gemm", "ts": 200, "dur": 60},
                     {
                         "ph": "X",
@@ -157,31 +175,44 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
 
     assert "Aggregate Trace Explorer" in aggregate
     assert "Cluster activity" in aggregate
-    assert "Cross-node start alignment" in aggregate
+    assert "Capacity and cross-node alignment" in aggregate
     assert "CPU, GPU, storage, and network activity" in aggregate
+    assert "What happened?" in aggregate
+    assert "Aggregate metrics" in aggregate
+    assert "Collective communication occupancy" in aggregate
+    assert 'data-tab-target="node-panel-node"' in aggregate
+    assert 'data-plot="aggregate-communication-timeline"' in aggregate
+    assert 'data-table-filter="aggregate-slow-span-rows"' in aggregate
     assert "Node trace: node" in aggregate
     assert "Top CPU operators" in aggregate
     assert '<script src="' not in aggregate
     assert node_page.is_file()
     node_html = node_page.read_text(encoding="utf-8")
     assert "Resource occupancy" in node_html
-    assert "CPU, GPU, and gradient synchronization timeline" in node_html
+    assert "CPU and GPU operation timeline" in node_html
+    assert "Collective communication occupancy" in node_html
     assert "Simulator hardware profile" in node_html
     assert "16.00 Gbps" in node_html
     assert "Absolute UTC time" in node_html
     assert r"Gradient\u002fNCCL sync" in node_html
     assert r"tiny_gpt \u002f rank 0 \u002f CPU" in node_html
     assert r"tiny_gpt \u002f rank 0 \u002f GPU" in node_html
+    assert r"tiny_gpt \u002f rank 0 \u002f collective stream" in node_html
     assert "CPU/GPU log" in node_html
     assert simulator_profile["trace_start_utc"].startswith("2026-07-28T19:42:00")
-    assert simulator_profile["nodes"]["node"]["ranks"][0]["hardware"][
-        "nic_link_speed_mbps"
-    ] == 16000
+    assert (
+        simulator_profile["nodes"]["node"]["ranks"][0]["hardware"][
+            "nic_link_speed_mbps"
+        ]
+        == 16000
+    )
 
 
 def test_hostfile_parser_ignores_slots_and_comments(tmp_path):
     hostfile = tmp_path / "hostfile"
-    hostfile.write_text("localhost slots=1\n# worker\n10.0.0.2 slots=2\n", encoding="utf-8")
+    hostfile.write_text(
+        "localhost slots=1\n# worker\n10.0.0.2 slots=2\n", encoding="utf-8"
+    )
 
     assert read_hosts(hostfile) == ["localhost", "10.0.0.2"]
 
@@ -225,7 +256,13 @@ def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
             {
                 "baseTimeNanoseconds": 1_000_000_000,
                 "traceEvents": [
-                    {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 10, "dur": 100},
+                    {
+                        "ph": "X",
+                        "cat": "cpu_op",
+                        "name": "aten::mm",
+                        "ts": 10,
+                        "dur": 100,
+                    },
                     {"ph": "X", "cat": "kernel", "name": "gemm", "ts": 20, "dur": 80},
                     {
                         "ph": "X",
@@ -234,7 +271,7 @@ def test_operator_trace_summary_streams_cpu_gpu_and_communication(tmp_path):
                         "ts": 30,
                         "dur": 20,
                     },
-                ]
+                ],
             }
         ),
         encoding="utf-8",
@@ -281,8 +318,12 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
     resource_events = (worker_dir / "resource-trace.jsonl").read_text(encoding="utf-8")
     assert '"resource": "CPU"' in resource_events
     assert '"operation": "Forward"' in resource_events
-    assert '"event": "span"' in (worker_dir / "metrics.jsonl").read_text(encoding="utf-8")
-    assert '"event": "step"' in (worker_dir / "metrics.jsonl").read_text(encoding="utf-8")
+    assert '"event": "span"' in (worker_dir / "metrics.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "step"' in (worker_dir / "metrics.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_upload_file_list_contains_dashboard_and_collected_traces(tmp_path):
@@ -336,7 +377,9 @@ def test_upload_uses_vm_and_timestamp_prefix(tmp_path):
     trace.parent.mkdir(parents=True)
     trace.write_text("{}", encoding="utf-8")
 
-    upload_visualization(tmp_path, "traces", "atharva-instace_20260728_191530", client=FakeClient())
+    upload_visualization(
+        tmp_path, "traces", "atharva-instace_20260728_191530", client=FakeClient()
+    )
 
     assert uploaded[0][0] == "atharva-instace_20260728_191530/index.html"
     assert uploaded[0][2:] == ("text/html", "inline", "no-cache")
