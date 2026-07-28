@@ -173,6 +173,7 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     )
     resource_events = [
         {
+            "schema_version": 2,
             "event": "resource_span",
             "host": "node",
             "job": "tiny_gpt",
@@ -182,8 +183,21 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
             "resource": resource,
             "start_ns": base_ns + offset_ms * 1_000_000,
             "end_ns": base_ns + (offset_ms + duration_ms) * 1_000_000,
+            "resource_start_ns": base_ns + offset_ms * 1_000_000,
+            "resource_end_ns": base_ns + (offset_ms + duration_ms) * 1_000_000,
             "duration_ms": duration_ms,
             "measurement": measurement,
+            "start_alignment": (
+                "observed_wall_clock"
+                if resource == "CPU"
+                else "enclosing_cpu_phase_start"
+            ),
+            "start_is_estimated": resource == "GPU",
+            "profiler_cpu_total_ms": duration_ms if resource == "CPU" else None,
+            "profiler_self_cpu_ms": 0.5 if resource == "CPU" else None,
+            "gpu_stream_elapsed_ms": duration_ms if resource == "GPU" else None,
+            "profiler_device_total_ms": duration_ms - 0.5 if resource == "GPU" else None,
+            "device_kernel_count": 3 if resource == "GPU" else None,
         }
         for operation, category, offset_ms, duration_ms in phase_resources
         for resource, measurement in (
@@ -233,6 +247,8 @@ def test_visualization_builds_from_rank_metrics(tmp_path):
     assert r"Gradient\u002fNCCL sync" in node_html
     assert r"tiny_gpt \u002f rank 0 | CPU" in node_html
     assert r"tiny_gpt \u002f rank 0 | GPU" in node_html
+    assert "enclosing_cpu_phase_start" in node_html
+    assert "kernel total=" in node_html
     assert r"tiny_gpt \u002f rank 0 \u002f collective stream" in node_html
     assert "CPU/GPU log" in node_html
     assert simulator_profile["trace_start_utc"].startswith("2026-07-28T19:42:00")
@@ -393,12 +409,63 @@ def test_training_trace_writes_profiler_artifacts(tmp_path, monkeypatch):
     resource_events = (worker_dir / "resource-trace.jsonl").read_text(encoding="utf-8")
     assert '"resource": "CPU"' in resource_events
     assert '"operation": "Forward"' in resource_events
+    assert '"schema_version": 2' in resource_events
+    assert '"start_alignment": "observed_wall_clock"' in resource_events
+    assert '"profiler_cpu_total_ms":' in resource_events
     assert '"event": "span"' in (worker_dir / "metrics.jsonl").read_text(
         encoding="utf-8"
     )
     assert '"event": "step"' in (worker_dir / "metrics.jsonl").read_text(
         encoding="utf-8"
     )
+
+
+def test_resource_trace_records_gpu_timing_provenance(tmp_path):
+    class FakeCudaEvent:
+        def elapsed_time(self, _other):
+            return 4.25
+
+    phase_event = SimpleNamespace(
+        name="job_span/0",
+        cpu_time_total=5100,
+        self_cpu_time_total=900,
+        device_time_total=3900,
+        kernels=["kernel-a", "kernel-b"],
+        cpu_children=[],
+    )
+    trace = TrainingTrace.__new__(TrainingTrace)
+    trace.output_dir = tmp_path
+    trace.host = "node"
+    trace.job = "tiny_gpt"
+    trace.rank = 0
+    trace.world_size = 1
+    trace.profiler = SimpleNamespace(events=lambda: [phase_event])
+    trace.span_metadata = {
+        0: {
+            "category": "Training",
+            "operation": "Forward",
+            "start_ns": 1_000_000_000,
+            "end_ns": 1_006_000_000,
+            "status": "ok",
+            "step": 1,
+        }
+    }
+    trace.cuda_span_events = {0: (FakeCudaEvent(), FakeCudaEvent())}
+
+    trace._export_resource_trace()
+
+    events = [json.loads(line) for line in (tmp_path / "resource-trace.jsonl").read_text().splitlines()]
+    cpu, gpu = events
+    assert cpu["schema_version"] == 2
+    assert cpu["phase"] == "Forward"
+    assert cpu["profiler_cpu_total_ms"] == 5.1
+    assert cpu["start_is_estimated"] is False
+    assert gpu["gpu_stream_elapsed_ms"] == 4.25
+    assert gpu["profiler_device_total_ms"] == 3.9
+    assert gpu["device_kernel_count"] == 2
+    assert gpu["resource_end_ns"] == 1_004_250_000
+    assert gpu["start_alignment"] == "enclosing_cpu_phase_start"
+    assert gpu["start_is_estimated"] is True
 
 
 def test_upload_file_list_contains_dashboard_and_collected_traces(tmp_path):

@@ -133,13 +133,38 @@ class TrainingTrace:
             self.events_file.close()
 
     def _export_resource_trace(self):
+        def kernel_count(event):
+            if event is None:
+                return None
+            count = 0
+            pending = [event]
+            while pending:
+                current = pending.pop()
+                count += len(current.kernels)
+                pending.extend(current.cpu_children)
+            return count
+
+        profiler_spans = {}
+        try:
+            for event in self.profiler.events():
+                if not event.name.startswith("job_span/"):
+                    continue
+                span_id = int(event.name.removeprefix("job_span/"))
+                profiler_spans[span_id] = event
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+
         output = self.output_dir / "resource-trace.jsonl"
         with output.open("w", encoding="utf-8") as resource_file:
             for span_id, metadata in self.span_metadata.items():
                 cuda_events = self.cuda_span_events.get(span_id)
+                profiler_span = profiler_spans.get(span_id)
+                cpu_wall_ms = (metadata["end_ns"] - metadata["start_ns"]) / 1_000_000
                 common = {
+                    "schema_version": 2,
                     "event": "resource_span",
                     "span_id": span_id,
+                    "phase": metadata["operation"],
                     "host": self.host,
                     "job": self.job,
                     "rank": self.rank,
@@ -149,18 +174,46 @@ class TrainingTrace:
                 cpu = {
                     **common,
                     "resource": "CPU",
-                    "duration_ms": (metadata["end_ns"] - metadata["start_ns"])
-                    / 1_000_000,
-                    "measurement": "wall_clock",
+                    "resource_start_ns": metadata["start_ns"],
+                    "resource_end_ns": metadata["end_ns"],
+                    "duration_ms": cpu_wall_ms,
+                    "cpu_wall_ms": cpu_wall_ms,
+                    "profiler_cpu_total_ms": (
+                        float(profiler_span.cpu_time_total) / 1000
+                        if profiler_span is not None
+                        else None
+                    ),
+                    "profiler_self_cpu_ms": (
+                        float(profiler_span.self_cpu_time_total) / 1000
+                        if profiler_span is not None
+                        else None
+                    ),
+                    "measurement": "phase_wall_clock",
+                    "start_alignment": "observed_wall_clock",
+                    "start_is_estimated": False,
                 }
                 resource_file.write(json.dumps(cpu, sort_keys=True) + "\n")
                 if cuda_events is not None:
                     gpu_duration_ms = float(cuda_events[0].elapsed_time(cuda_events[1]))
+                    gpu_start_ns = metadata["start_ns"]
                     gpu = {
                         **common,
                         "resource": "GPU",
+                        "resource_start_ns": gpu_start_ns,
+                        "resource_end_ns": gpu_start_ns + int(gpu_duration_ms * 1_000_000),
                         "duration_ms": gpu_duration_ms,
-                        "measurement": "cuda_event_elapsed",
+                        "gpu_stream_elapsed_ms": gpu_duration_ms,
+                        "profiler_device_total_ms": (
+                            float(profiler_span.device_time_total) / 1000
+                            if profiler_span is not None
+                            else None
+                        ),
+                        "device_kernel_count": (
+                            kernel_count(profiler_span)
+                        ),
+                        "measurement": "cuda_stream_elapsed",
+                        "start_alignment": "enclosing_cpu_phase_start",
+                        "start_is_estimated": True,
                     }
                     resource_file.write(json.dumps(gpu, sort_keys=True) + "\n")
 

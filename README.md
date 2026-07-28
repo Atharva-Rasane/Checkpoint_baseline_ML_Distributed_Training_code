@@ -173,6 +173,8 @@ The hardware profile records CPU and RAM capacity, GPU model/memory/compute capa
 
 Each rank writes wall-clock-aligned job spans, separate wall-clock CPU and CUDA-event GPU resource spans, an operator timeline, graph execution trace, step metrics, GPU memory, and checkpoint events below `visualization/traces/<run-id>/<host>/rank-<rank>/`.
 
+`resource-trace.jsonl` uses a versioned per-phase resource schema. It records explicit CPU/GPU start and end fields, CPU wall and profiler timing, GPU stream and kernel timing, kernel counts, and whether a resource start is observed or estimated. Perfetto remains the exact source for individual operator and GPU-kernel placement.
+
 Collect traces from every host in `hostfile` and build the dashboard:
 
 ```bash

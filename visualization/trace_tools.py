@@ -459,14 +459,20 @@ def build_resource_spans(workers, logical_spans):
             for event in _read_jsonl(path):
                 if event.get("event") != "resource_span":
                     continue
+                event_start_ns = event.get("resource_start_ns", event.get("start_ns"))
                 start_s = (
-                    (int(event["start_ns"]) - base_ns) / 1_000_000_000
-                    if event.get("start_ns") is not None
+                    (int(event_start_ns) - base_ns) / 1_000_000_000
+                    if event_start_ns is not None
                     else 0.0
                 )
                 duration_s = max(0.0, float(event.get("duration_ms") or 0) / 1000)
-                start_ns = int(event.get("start_ns") or base_ns)
-                end_ns = start_ns + int(duration_s * 1_000_000_000)
+                start_ns = int(event_start_ns or base_ns)
+                event_end_ns = event.get("resource_end_ns")
+                end_ns = (
+                    int(event_end_ns)
+                    if event_end_ns is not None
+                    else start_ns + int(duration_s * 1_000_000_000)
+                )
                 resource_spans.append(
                     {
                         **event,
@@ -518,6 +524,26 @@ def _layout(title, height=430):
     }
 
 
+def _resource_measurement_summary(row):
+    if row.get("resource") == "CPU":
+        details = [f"wall={row['duration_s'] * 1000:.3f}ms"]
+        if row.get("profiler_cpu_total_ms") is not None:
+            details.append(f"profiler total={float(row['profiler_cpu_total_ms']):.3f}ms")
+        if row.get("profiler_self_cpu_ms") is not None:
+            details.append(f"self CPU={float(row['profiler_self_cpu_ms']):.3f}ms")
+        return ", ".join(details)
+    if row.get("resource") == "GPU":
+        details = [f"stream elapsed={row['duration_s'] * 1000:.3f}ms"]
+        if row.get("profiler_device_total_ms") is not None:
+            details.append(
+                f"kernel total={float(row['profiler_device_total_ms']):.3f}ms"
+            )
+        if row.get("device_kernel_count") is not None:
+            details.append(f"direct kernels={int(row['device_kernel_count'])}")
+        return ", ".join(details)
+    return f"elapsed={row['duration_s'] * 1000:.3f}ms"
+
+
 def resource_timeline(spans, host):
     figure = go.Figure()
     grouped = defaultdict(list)
@@ -565,6 +591,9 @@ def resource_timeline(spans, host):
                         row.get("measurement", "wall_clock"),
                         row["start_utc"],
                         row["worker"],
+                        row.get("start_alignment", "legacy_phase_start"),
+                        "yes" if row.get("start_is_estimated") else "no",
+                        _resource_measurement_summary(row),
                     ]
                     for row in rows
                 ],
@@ -574,7 +603,10 @@ def resource_timeline(spans, host):
                     "<br>step=%{customdata[3]}<br>start UTC=%{customdata[7]}"
                     "<br>duration=%{customdata[4]:.3f}ms"
                     "<br>status=%{customdata[5]}"
-                    "<br>measurement=%{customdata[6]}<extra></extra>"
+                    "<br>measurement=%{customdata[6]}"
+                    "<br>start alignment=%{customdata[9]}"
+                    "<br>estimated start=%{customdata[10]}"
+                    "<br>timing detail=%{customdata[11]}<extra></extra>"
                 ),
             )
         )
